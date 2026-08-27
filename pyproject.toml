@@ -1,0 +1,80 @@
+[project]
+name = "dota-harvest"
+version = "0.1.0"
+description = "Collect Dota 2 match data from STRATZ and OpenDota into partitioned Parquet"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["dota2", "stratz", "opendota", "dataset", "esports"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "requests>=2.32",
+    "duckdb>=1.4.2",
+    "python-dotenv>=1.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/Jarod-Rain/dota-harvest"
+Issues = "https://github.com/Jarod-Rain/dota-harvest/issues"
+
+[project.scripts]
+dota-harvest = "dota_harvest.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "N",    # pep8-naming
+    "D",    # pydocstyle
+    "SIM",  # flake8-simplify
+    "RET",  # flake8-return
+    "PTH",  # prefer pathlib
+    "C4",   # comprehensions
+    "ARG",  # unused arguments
+    "TRY",  # exception antipatterns
+]
+ignore = [
+    "TRY003",
+    "D413",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D103", "ARG001", "ARG002"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

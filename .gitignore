@@ -1,0 +1,30 @@
+# Collected data. Regenerable from the APIs, and far too large to track.
+data/
+*.sqlite
+*.parquet
+
+# Credentials. .env.example is the tracked template.
+.env
+!.env.example
+
+# Environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
