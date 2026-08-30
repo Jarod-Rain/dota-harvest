@@ -74,6 +74,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
         ranked_only=not args.all_lobbies,
         min_age_hours=args.min_age_hours,
         reserve=args.reserve,
+        seek=not args.no_seek,
     )
 
 
@@ -224,6 +225,12 @@ def main() -> None:
         default=MIN_MATCH_AGE_HOURS,
         help=f"skip matches younger than this; STRATZ trails OpenDota on ingest. "
         f"Default {MIN_MATCH_AGE_HOURS:g}.",
+    )
+    d.add_argument(
+        "--no-seek",
+        action="store_true",
+        help="do not jump to the collectable window first; page from the newest "
+        "match instead. Slower by ~160 pages when --min-age-hours is set.",
     )
     d.add_argument(
         "--reserve",
