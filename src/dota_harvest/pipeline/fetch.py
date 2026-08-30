@@ -13,14 +13,20 @@ import sqlite3
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Final
 
 from dota_harvest.api.clients import build_batch_query, parse_batch_response, stratz_query
 from dota_harvest.api.http import QuotaExhaustedError
 from dota_harvest.core.config import RAW_DIR, STRATZ_BATCH, STRATZ_SLEEP
-from dota_harvest.core.manifest import MatchStatus, connect, pending_ids
+from dota_harvest.core.manifest import (
+    MatchStatus,
+    connect,
+    known_walks,
+    parse_walk,
+    pending_ids,
+)
 
 #: Stop after this many consecutive batches return nothing. A run of empties
 #: means something systemic -- a bad token, a schema break, too large a batch --
@@ -94,6 +100,31 @@ def _mark_fetched(conn: sqlite3.Connection, ids: list[int], raw_file: str) -> No
     conn.commit()
 
 
+def _suggest_walks(conn: sqlite3.Connection, walks: Sequence[str]) -> None:
+    """Explain an empty selection by listing the walks that do exist.
+
+    Args:
+        conn: Open manifest connection.
+        walks: The selectors that matched nothing pending.
+
+    Note:
+        A typo'd label and a fully-fetched walk both yield zero ids, and the
+        two need opposite responses. Naming the known walks separates them at a
+        glance.
+    """
+    known = known_walks(conn)
+    if not known:
+        print("  no walks in the manifest yet; run discover first")
+        return
+    selected = {parse_walk(selector)[1] for selector in walks}
+    if not any(label in selected for _, label, _ in known):
+        print("  no walk matches. Known walks:")
+    else:
+        print("  those walks have nothing left to fetch. Known walks:")
+    for source, label, count in known:
+        print(f"    {source}:{label:<20} {count:>8,} matches")
+
+
 def _new_shard_path() -> Path:
     """Generate a unique filename for this run's output shard.
 
@@ -117,7 +148,12 @@ def _report(written: int, started: float, destination: Path) -> None:
     print(f"wrote {written:,} matches in {elapsed / 60:.1f} min ({rate:,.0f}/hr) -> {destination}")
 
 
-def run(limit: int = 1000, batch: int = STRATZ_BATCH, sleep: float = STRATZ_SLEEP) -> int:
+def run(
+    limit: int = 1000,
+    batch: int = STRATZ_BATCH,
+    sleep: float = STRATZ_SLEEP,
+    walks: Sequence[str] | None = None,
+) -> int:
     """Fetch detail for pending match ids and append it to a new raw shard.
 
     Each batch becomes one aliased GraphQL request. Every id in the batch lands
@@ -129,6 +165,8 @@ def run(limit: int = 1000, batch: int = STRATZ_BATCH, sleep: float = STRATZ_SLEE
         limit: Maximum pending ids to attempt this run.
         batch: Aliased match lookups per request.
         sleep: Seconds to pause between requests.
+        walks: Restrict to these walk selectors (``"label"`` or
+            ``"source:label"``). ``None`` fetches from every walk.
 
     Returns:
         The number of matches written. Zero means the output shard was removed.
@@ -138,14 +176,19 @@ def run(limit: int = 1000, batch: int = STRATZ_BATCH, sleep: float = STRATZ_SLEE
         on disk, so anything unattempted stays pending.
     """
     conn = connect()
-    ids = pending_ids(conn, limit)
+    ids = pending_ids(conn, limit, walks)
     if not ids:
-        print("nothing pending; run discover first")
+        if walks:
+            print(f"nothing pending in {', '.join(walks)}")
+            _suggest_walks(conn, walks)
+        else:
+            print("nothing pending; run discover first")
         return 0
 
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     destination = _new_shard_path()
-    print(f"{len(ids)} pending, batch={batch} -> {destination}")
+    scope = f" from {', '.join(walks)}" if walks else ""
+    print(f"{len(ids)} pending{scope}, batch={batch} -> {destination}")
 
     written = 0
     dead_streak = 0

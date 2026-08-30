@@ -18,7 +18,14 @@ from dota_harvest.core.config import (
     STRATZ_SLEEP,
     describe_paths,
 )
-from dota_harvest.core.manifest import connect, fmt_date, parse_date
+from dota_harvest.core.manifest import (
+    connect,
+    fmt_date,
+    parse_date,
+    parse_walk,
+    pending_ids,
+    remove_walks,
+)
 from dota_harvest.diagnostics import check, probe_retention, probe_versions
 from dota_harvest.pipeline import discover, fetch, pro, reference, transform
 
@@ -78,9 +85,54 @@ def cmd_discover(args: argparse.Namespace) -> None:
     )
 
 
+def walk_list(value: str) -> list[str]:
+    """Parse a comma-separated list of walk selectors.
+
+    Args:
+        value: Raw command-line text, e.g. ``"recent-2d,public:patch-741"``.
+
+    Returns:
+        The individual selectors, whitespace stripped.
+
+    Raises:
+        argparse.ArgumentTypeError: If the list is empty or any selector is
+            malformed. Failing here rather than silently matching nothing keeps
+            a typo from looking like a fully-collected walk.
+    """
+    selectors = [part.strip() for part in value.split(",") if part.strip()]
+    if not selectors:
+        raise argparse.ArgumentTypeError("expected at least one walk")
+    for selector in selectors:
+        try:
+            parse_walk(selector)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
+    return selectors
+
+
 def cmd_fetch(args: argparse.Namespace) -> None:
     """Pull match detail from STRATZ into the raw landing zone."""
-    fetch.run(limit=args.limit, batch=args.batch, sleep=args.sleep)
+    fetch.run(limit=args.limit, batch=args.batch, sleep=args.sleep, walks=args.walks)
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    """Delete a walk's pending matches and its discovery cursor."""
+    conn = connect()
+
+    pending = len(pending_ids(conn, 10**9, args.walks))
+    tally = remove_walks(conn, args.walks, include_fetched=args.all)
+
+    deleted = tally.pop("deleted", 0)
+    kept = tally.pop("kept_fetched", 0)
+    cursors = tally.pop("cursors", 0)
+
+    print(f"removing {', '.join(args.walks)}")
+    for status, count in sorted(tally.items()):
+        print(f"  {status:<12} {count:>8,} deleted")
+    if kept:
+        print(f"  {'fetched':<12} {kept:>8,} KEPT (data is in raw/; use --all to delete)")
+    print(f"  {'cursors':<12} {cursors:>8,} dropped")
+    print(f"\n{deleted:,} rows removed ({pending:,} were still pending)")
 
 
 def cmd_leagues(args: argparse.Namespace) -> None:
@@ -245,7 +297,29 @@ def main() -> None:
     f.add_argument("--limit", type=int, default=1000)
     f.add_argument("--batch", type=int, default=STRATZ_BATCH)
     f.add_argument("--sleep", type=float, default=STRATZ_SLEEP)
+    f.add_argument(
+        "--walks",
+        type=walk_list,
+        default=None,
+        help="only fetch matches from these walks: comma-separated "
+        "'label' or 'source:label' (e.g. recent-2d,public:patch-741). "
+        "Default is every walk.",
+    )
     f.set_defaults(fn=cmd_fetch)
+
+    rm = sub.add_parser("remove", help="delete a walk's pending matches and cursor")
+    rm.add_argument(
+        "walks",
+        type=walk_list,
+        help="comma-separated 'label' or 'source:label' to remove",
+    )
+    rm.add_argument(
+        "--all",
+        action="store_true",
+        help="also delete rows already fetched. Their responses stay in raw/ but "
+        "nothing will map them back to a match id.",
+    )
+    rm.set_defaults(fn=cmd_remove)
 
     r = sub.add_parser("reference", help="constants, patch table, item taxonomy")
     r.add_argument("--check", action="store_true", help="report only, write nothing")
