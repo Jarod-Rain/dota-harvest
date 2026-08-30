@@ -19,7 +19,20 @@ from typing import Any, Final
 from dota_harvest.api.clients import opendota_get
 from dota_harvest.api.http import QuotaExhaustedError, quota_for
 from dota_harvest.core.config import MIN_MATCH_AGE_HOURS, OPENDOTA_URL
-from dota_harvest.core.manifest import connect, fmt_date, get_cursor, set_cursor
+from dota_harvest.core.manifest import (
+    STOP_ARCHIVE_EXHAUSTED,
+    STOP_PAGE_BUDGET,
+    STOP_QUOTA,
+    STOP_REACHED_FLOOR,
+    STOP_RESERVE,
+    TERMINAL_REASONS,
+    connect,
+    finish_walk,
+    fmt_date,
+    get_cursor,
+    set_cursor,
+    start_walk,
+)
 from dota_harvest.core.types import JSONMapping
 
 #: One match summary as returned by OpenDota's discovery endpoints.
@@ -42,28 +55,21 @@ _ENDPOINTS: Final[dict[Source, str]] = {
 #: OpenDota's lobby type for ranked matchmaking.
 RANKED_LOBBY_TYPE: Final[int] = 7
 
-#: Modulus for the deterministic subsample. Match ids are spread finely enough
-#: that the low four digits give ~0.01% granularity.
+#: Modulus for the deterministic subsample
 SAMPLE_MODULUS: Final[int] = 10_000
 
 SECONDS_PER_HOUR: Final[int] = 3600
 
-#: Reason string for a match STRATZ has not had time to index. Named because the
-#: walk special-cases it: a page dropped entirely for this reason means the walk
-#: simply has not travelled far enough back yet.
+#: Reason string for a match STRATZ has not had time to index
 TOO_NEW: Final[str] = "too new"
 
-#: Probes the seek may spend locating the collectable window. Interpolation
-#: converges in three or four; the cap only bounds a pathological case.
+#: Probes the seek may spend locating the collectable window
 SEEK_MAX_PROBES: Final[int] = 6
 
-#: Stop seeking once the entry page's newest match is within this many hours
-#: below the age cutoff. Tighter than this wastes probes for no extra coverage,
-#: since a page only spans ~18 minutes.
+#: Stop seeking once the entry page's newest match is within this many hours below the age cutoff
 SEEK_TOLERANCE_HOURS: Final[float] = 1.0
 
-#: Fallback id-per-second rate if a page is too uniform to measure one. Match
-#: ids climb at roughly this rate; see DATA.md.
+#: Fallback id-per-second rate if a page is too uniform to measure one
 DEFAULT_ID_RATE: Final[float] = 30.0
 
 _INSERT_SQL: Final[str] = (
@@ -275,8 +281,7 @@ def seek_to_age_cutoff(
             return guess, probes
 
         # Secant step: ids and seconds actually traversed between the anchor and
-        # this probe give the real rate over the range being searched, which the
-        # page contents systematically underestimate.
+        # this probe give the real rate over the range being searched
         travelled_ids = anchor_id - guess
         travelled_seconds = anchor_ts - newest
         if travelled_ids > 0 and travelled_seconds > 0:
@@ -322,7 +327,7 @@ def record_matches(conn: sqlite3.Connection, rows: list[MatchRow], source: str, 
 def run(
     source: str = Source.PUBLIC,
     min_rank: int = 75,
-    pages: int = 20,
+    pages: int = 3000,
     start_before: int | None = None,
     label: str = "main",
     until_ts: int | None = None,
@@ -359,18 +364,38 @@ def run(
     """
     conn = connect()
 
-    # Forward collection and historical backfill are independent walks over the
-    # same source. Sharing one cursor means whichever ran last dictates where
-    # the other resumes -- silently, since both keep appearing to work.
+    # Lock this walk's parameters on first use, and adopt the stored ones on every later run
+    locked = start_walk(
+        conn,
+        source,
+        label,
+        {
+            "source": source,
+            "min_rank": min_rank,
+            "pages": pages,
+            "until_ts": until_ts,
+            "sample": sample,
+            "ranked_only": ranked_only,
+            "min_age_hours": min_age_hours,
+            "reserve": reserve,
+            "seek": seek,
+        },
+    )
+    min_rank = locked["min_rank"]  # pyright: ignore[reportAssignmentType]
+    pages = locked["pages"]  # pyright: ignore[reportAssignmentType]
+    until_ts = locked["until_ts"]  # pyright: ignore[reportAssignmentType]
+    sample = locked["sample"]  # pyright: ignore[reportAssignmentType]
+    ranked_only = locked["ranked_only"]  # pyright: ignore[reportAssignmentType]
+    min_age_hours = locked["min_age_hours"]  # pyright: ignore[reportAssignmentType]
+    reserve = locked["reserve"]  # pyright: ignore[reportAssignmentType]
+    seek = locked["seek"]  # pyright: ignore[reportAssignmentType]
+
+    # Forward collection and historical backfill are independent walks over the same source.
     key = f"{source}:{label}"
     cursor = start_before or get_cursor(conn, key)
     age_cutoff = time.time() - min_age_hours * SECONDS_PER_HOUR
 
-    # Seek on a fresh walk, and also on a resumed one still stranded above the
-    # cutoff -- a walk that stalled there has no way to free itself otherwise,
-    # since every page it fetches is too new to keep and the cursor barely
-    # moves. An explicit --start-before is always honoured: that is a deliberate
-    # override, and moving it would silently re-collect or skip a range.
+    # Seek on a fresh walk, and also on a resumed one still stranded above the cutoff
     if seek and start_before is None and min_age_hours > 0:
         entry, probes = seek_to_age_cutoff(source, min_rank, age_cutoff)
         if entry is not None and (cursor is None or entry < cursor):
@@ -382,6 +407,8 @@ def run(
     print(f"walk '{key}' " + (f"resuming from {cursor:,}" if cursor else "from newest"))
 
     total_new = 0
+    pages_done = 0
+    stop_reason = STOP_PAGE_BUDGET
     for page in range(pages):
         try:
             rows = discover_page(source, cursor, min_rank)
@@ -390,17 +417,19 @@ def run(
             # this same command tomorrow resumes exactly here.
             print(f"\n{exc}")
             print(f"stopped at page {page} with {total_new} new ids this run.")
-            print(f"re-run the same command to resume walk '{key}' from {cursor:,}.")
+            print(f"resume with: dota-harvest discover --resume {key}")
+            stop_reason = STOP_QUOTA
             break
 
         if not rows:
             print("no more results")
+            stop_reason = STOP_ARCHIVE_EXHAUSTED
             break
 
-        # max() is the newest match on the page; if even that predates the
-        # floor, every later page is older still.
+        # max() is the newest match on the page
         if until_ts and max((row.get("start_time") or 0) for row in rows) < until_ts:
             print(f"reached floor {fmt_date(until_ts)}; stopping")
+            stop_reason = STOP_REACHED_FLOOR
             break
 
         age_cutoff = time.time() - min_age_hours * SECONDS_PER_HOUR
@@ -422,11 +451,10 @@ def run(
                 dropped[reason] += 1
         total_new += record_matches(conn, kept, source, label)
 
-        # Advance over every row returned, not just the kept ones: the cursor
-        # tracks how far the walk has travelled, which is independent of what
-        # the filters accepted.
+        # Advance over every row returned, not just the kept ones
         cursor = min(row["match_id"] for row in rows)
         set_cursor(conn, key, cursor)
+        pages_done += 1
 
         oldest = min((row.get("start_time") or 0) for row in rows)
         left = quota_for(OPENDOTA_URL).get("day")
@@ -439,7 +467,7 @@ def run(
             summary = ", ".join(f"{count} {reason}" for reason, count in dropped.most_common())
             print(f"    dropped: {summary}")
         # A page that keeps nothing because everything is too new means the walk
-        # has not travelled far enough back yet -- not that the archive is empty.
+        # has not travelled far enough back yet
         if not kept and dropped[TOO_NEW] == len(rows):
             print(
                 f"    note: all rows are younger than the {min_age_hours:g}h STRATZ "
@@ -448,13 +476,15 @@ def run(
             if not seek:
                 print("    drop --no-seek to jump straight to the collectable window.")
 
-        # The counter arrives on every response, so the wall is visible before
-        # we walk into it. Stopping here costs nothing; taking the 429 costs a
-        # wasted call and leaves the counter negative.
         if left is not None and left <= reserve:
             print(f"\ndaily quota nearly spent ({left} left, reserve={reserve}).")
-            print(f"re-run the same command tomorrow to resume '{key}' from {cursor:,}.")
+            print(f"resume tomorrow with: dota-harvest discover --resume {key}")
+            stop_reason = STOP_RESERVE
             break
 
-    print(f"discovered {total_new} new ids")
+    finish_walk(conn, source, label, stop_reason, pages_done)
+    state = "done" if stop_reason in TERMINAL_REASONS else "open"
+    print(f"discovered {total_new} new ids ({stop_reason}; walk is {state})")
+    if state == "open":
+        print(f"resume with: dota-harvest discover --resume {key}")
     return total_new
