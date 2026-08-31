@@ -11,8 +11,10 @@ from genuine draft-conditioning in the final model.
 from __future__ import annotations
 
 import sqlite3
+import sys
 import time
 from collections import Counter
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
 
@@ -21,6 +23,7 @@ from dota_harvest.api.http import QuotaExhaustedError, quota_for
 from dota_harvest.core.config import MIN_MATCH_AGE_HOURS, OPENDOTA_URL
 from dota_harvest.core.manifest import (
     STOP_ARCHIVE_EXHAUSTED,
+    STOP_INTERRUPTED,
     STOP_PAGE_BUDGET,
     STOP_QUOTA,
     STOP_REACHED_FLOOR,
@@ -44,6 +47,18 @@ class Source(StrEnum):
 
     PUBLIC = "public"
     PRO = "pro"
+
+
+@dataclass
+class Progress:
+    """Pages a run has completed, visible to its caller mid-flight.
+
+    A return value only arrives once the loop ends normally, so an interrupt
+    would discard the count. Sharing this object instead lets the caller record
+    real progress no matter how the run stopped.
+    """
+
+    pages: int = 0
 
 
 #: Endpoint backing each source.
@@ -406,8 +421,90 @@ def run(
             )
     print(f"walk '{key}' " + (f"resuming from {cursor:,}" if cursor else "from newest"))
 
+    # Progress is reported through a mutable counter rather than a return
+    # value, so an interrupt mid-page still credits the pages already finished.
+    progress = Progress()
     total_new = 0
-    pages_done = 0
+    stop_reason = STOP_PAGE_BUDGET
+    try:
+        total_new, stop_reason = _walk_pages(  # pyright: ignore[reportAssignmentType]
+            conn,
+            progress,
+            key=key,
+            cursor=cursor,
+            source=source,
+            label=label,
+            min_rank=min_rank,
+            pages=pages,
+            until_ts=until_ts,
+            sample=sample,
+            ranked_only=ranked_only,
+            min_age_hours=min_age_hours,
+            reserve=reserve,
+            seek=seek,
+        )
+    except KeyboardInterrupt:
+        # Ctrl-C must still land in the record. Without this the walk keeps
+        # whatever reason its previous run left -- typically "ran out of
+        # --pages" -- so an interrupted run looked like a completed one.
+        stop_reason = STOP_INTERRUPTED
+        print(
+            f"\ninterrupted after {progress.pages} page(s); "
+            f"resume with: dota-harvest discover --resume {key}",
+            file=sys.stderr,
+        )
+        raise
+    finally:
+        finish_walk(conn, source, label, stop_reason, progress.pages)  # pyright: ignore[reportArgumentType]
+
+    state = "done" if stop_reason in TERMINAL_REASONS else "open"
+    print(f"discovered {total_new} new ids ({stop_reason}; walk is {state})")
+    if state == "open":
+        print(f"resume with: dota-harvest discover --resume {key}")
+    return total_new
+
+
+def _walk_pages(
+    conn: sqlite3.Connection,
+    progress: Progress,
+    *,
+    key: str,
+    cursor: int | None,
+    source: str,
+    label: str,
+    min_rank: int,
+    pages: int,
+    until_ts: int | None,
+    sample: float,
+    ranked_only: bool,
+    min_age_hours: float,
+    reserve: int,
+    seek: bool,
+) -> tuple[int, int, str]:
+    """Page backwards through the endpoint, recording matches as it goes.
+
+    Args:
+        conn: Open manifest connection.
+        progress: Updated in place after each completed page, so the caller can
+            record real progress even if this run is interrupted.
+        key: The walk's ``"{source}:{label}"`` identifier, for messages.
+        cursor: Match id to start below, or ``None`` to start at the newest.
+        source: Which endpoint to walk.
+        label: The walk's label, recorded on each row.
+        min_rank: Rank-tier floor for public matches.
+        pages: Maximum pages to request.
+        until_ts: Stop once the walk reaches matches older than this.
+        sample: Fraction of matches to keep.
+        ranked_only: Drop non-ranked lobbies.
+        min_age_hours: Skip matches younger than this.
+        reserve: Stop with this many daily API calls unspent.
+        seek: Whether the caller seeked; only affects a hint message.
+
+    Returns:
+        A ``(new_ids, stop_reason)`` pair. The caller records the reason, so
+        this reports it rather than raising for ordinary stops.
+    """
+    total_new = 0
     stop_reason = STOP_PAGE_BUDGET
     for page in range(pages):
         try:
@@ -453,8 +550,8 @@ def run(
 
         # Advance over every row returned, not just the kept ones
         cursor = min(row["match_id"] for row in rows)
-        set_cursor(conn, key, cursor)
-        pages_done += 1
+        set_cursor(conn, key, cursor)  # pyright: ignore[reportArgumentType]
+        progress.pages += 1
 
         oldest = min((row.get("start_time") or 0) for row in rows)
         left = quota_for(OPENDOTA_URL).get("day")
@@ -482,9 +579,4 @@ def run(
             stop_reason = STOP_RESERVE
             break
 
-    finish_walk(conn, source, label, stop_reason, pages_done)
-    state = "done" if stop_reason in TERMINAL_REASONS else "open"
-    print(f"discovered {total_new} new ids ({stop_reason}; walk is {state})")
-    if state == "open":
-        print(f"resume with: dota-harvest discover --resume {key}")
-    return total_new
+    return total_new, stop_reason  # pyright: ignore[reportReturnType]

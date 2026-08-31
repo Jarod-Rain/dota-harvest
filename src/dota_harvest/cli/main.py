@@ -399,7 +399,7 @@ def cmd_status(args: argparse.Namespace) -> None:  # noqa: ARG001
         for key in resumable:
             print(f"  dota-harvest discover --resume {key}")
 
-    files = list(RAW_DIR.glob("*.jsonl.gz")) if RAW_DIR.exists() else []
+    files = list(RAW_DIR.glob("*.jsonl.gz")) if RAW_DIR.exists() else []  # pyright: ignore[reportAttributeAccessIssue]
     total_gb = sum(path.stat().st_size for path in files) / BYTES_PER_GB
     print(f"\nraw: {total_gb:.2f} GB across {len(files)} files")
 

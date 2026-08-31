@@ -15,6 +15,7 @@ from dota_harvest.core.manifest import (
     RANGE_PARAMS,
     SCHEMA,
     STOP_ARCHIVE_EXHAUSTED,
+    STOP_INTERRUPTED,
     STOP_PAGE_BUDGET,
     STOP_QUOTA,
     STOP_REACHED_FLOOR,
@@ -29,6 +30,7 @@ from dota_harvest.core.manifest import (
     start_walk,
     walk_key,
 )
+from dota_harvest.pipeline.discover import Progress
 
 PARAMS = {
     "source": "public",
@@ -112,8 +114,8 @@ def test_terminal_reasons_close_the_walk(conn, reason):
     assert get_walk(conn, "alpha")["state"] == WalkState.DONE
 
 
-@pytest.mark.parametrize("reason", [STOP_PAGE_BUDGET, STOP_QUOTA, STOP_RESERVE])
-def test_interruptions_leave_the_walk_open(conn, reason):
+@pytest.mark.parametrize("reason", [STOP_PAGE_BUDGET, STOP_QUOTA, STOP_RESERVE, STOP_INTERRUPTED])
+def test_non_terminal_reasons_leave_the_walk_open(conn, reason):
     """Page budget counts as unfinished: more pages remain to collect."""
     start_walk(conn, "public", "alpha", PARAMS)
     finish_walk(conn, "public", "alpha", reason, 3)
@@ -234,3 +236,45 @@ def test_unchanged_params_leave_the_record_alone(conn):
     before = get_walk(conn, "alpha")["updated_at"]
     start_walk(conn, "public", "alpha", PARAMS)
     assert get_walk(conn, "alpha")["updated_at"] == before
+
+
+# --- interruption --------------------------------------------------------
+
+
+def test_interrupted_is_not_a_terminal_reason():
+    """Ctrl-C leaves ground uncovered, so the walk must stay resumable."""
+    assert STOP_INTERRUPTED not in TERMINAL_REASONS
+
+
+def test_interrupt_leaves_the_walk_open(conn):
+    start_walk(conn, "public", "alpha", PARAMS)
+    finish_walk(conn, "public", "alpha", STOP_INTERRUPTED, 5)
+    walk = get_walk(conn, "alpha")
+    assert walk["state"] == WalkState.OPEN
+    assert walk["reason"] == STOP_INTERRUPTED
+
+
+def test_interrupt_credits_the_pages_already_finished(conn):
+    """The count must reflect real progress, not zero."""
+    start_walk(conn, "public", "alpha", PARAMS)
+    finish_walk(conn, "public", "alpha", STOP_INTERRUPTED, 5)
+    assert get_walk(conn, "alpha")["pages_done"] == 5
+
+
+def test_interrupt_overwrites_a_stale_reason(conn):
+    """The bug: an interrupted run used to keep the prior run's reason."""
+    start_walk(conn, "public", "alpha", PARAMS)
+    finish_walk(conn, "public", "alpha", STOP_PAGE_BUDGET, 3)
+    finish_walk(conn, "public", "alpha", STOP_INTERRUPTED, 2)
+    walk = get_walk(conn, "alpha")
+    assert walk["reason"] == STOP_INTERRUPTED
+    assert walk["pages_done"] == 5
+
+
+def test_progress_starts_at_zero_and_accumulates():
+    """The counter the run shares with its caller so an interrupt sees it."""
+    progress = Progress()
+    assert progress.pages == 0
+    progress.pages += 1
+    progress.pages += 1
+    assert progress.pages == 2
