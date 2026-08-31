@@ -4,13 +4,15 @@ Cheap, transactional, and survives crashes -- which matters when a fetch run
 lasts a day. It also keeps 'never seen' distinct from 'seen and unavailable', a
 distinction that is invisible if you infer state by scanning output files.
 
-The manifest holds two tables: ``matches`` (one row per match id, carrying its
-lifecycle status) and ``cursors`` (one row per discovery walk, recording where
-to resume).
+The manifest holds three tables: ``matches`` (one row per match id, carrying its
+lifecycle status), ``cursors`` (one row per discovery walk, recording where to
+resume), and ``walks`` (one row per discovery walk, holding the parameters it
+was created with and whether it has finished).
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -74,6 +76,22 @@ CREATE INDEX IF NOT EXISTS idx_start  ON matches(start_time);
 CREATE TABLE IF NOT EXISTS cursors (
     key   TEXT PRIMARY KEY,           -- "{source}:{label}"
     value INTEGER
+);
+
+-- One row per discovery walk, holding the parameters it was created with.
+-- Those are locked at creation: a walk's matches are only a coherent sample if
+-- every page was collected under the same filters, so resuming reads them back
+-- rather than trusting the operator to retype them identically.
+CREATE TABLE IF NOT EXISTS walks (
+    key        TEXT PRIMARY KEY,      -- "{source}:{label}"
+    source     TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    params     TEXT NOT NULL,         -- JSON, the locked run parameters
+    state      TEXT NOT NULL,         -- 'open' | 'done'
+    reason     TEXT,                  -- why it last stopped
+    pages_done INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER,
+    updated_at INTEGER
 );
 """
 
@@ -159,6 +177,185 @@ def set_cursor(conn: sqlite3.Connection, key: str, value: int) -> None:
         (key, value),
     )
     conn.commit()
+
+
+class WalkState(StrEnum):
+    """Whether a discovery walk has more ground to cover.
+
+    ``OPEN``
+        The run stopped before exhausting its range -- quota spent, daily
+        reserve reached, or the page budget used up. Resumable.
+    ``DONE``
+        The walk reached its ``--until`` floor or the archive ran out. Nothing
+        remains to collect under these parameters.
+    """
+
+    OPEN = "open"
+    DONE = "done"
+
+
+#: Why a walk last stopped. The first two mean the walk is finished; the rest
+#: leave it resumable.
+STOP_REACHED_FLOOR: Final[str] = "reached --until floor"
+STOP_ARCHIVE_EXHAUSTED: Final[str] = "no more results"
+STOP_PAGE_BUDGET: Final[str] = "ran out of --pages"
+STOP_QUOTA: Final[str] = "daily API quota exhausted"
+STOP_RESERVE: Final[str] = "hit --reserve"
+STOP_INTERRUPTED: Final[str] = "interrupted"
+
+#: Stop reasons that mean the walk has nothing left to collect.
+TERMINAL_REASONS: Final[frozenset[str]] = frozenset({STOP_REACHED_FLOOR, STOP_ARCHIVE_EXHAUSTED})
+
+#: Parameters that bound how far a run travels rather than which matches it
+#: keeps. A resume may change these without making the walk's rows
+#: heterogeneous, so they are not locked; everything else is.
+RANGE_PARAMS: Final[frozenset[str]] = frozenset({"pages", "until_ts"})
+
+
+def walk_key(source: str, label: str) -> str:
+    """Build the canonical identifier for a walk."""
+    return f"{source}:{label}"
+
+
+def start_walk(
+    conn: sqlite3.Connection,
+    source: str,
+    label: str,
+    params: dict[str, object],
+) -> dict[str, object]:
+    """Register a walk's parameters, or return the ones already stored.
+
+    Args:
+        conn: Open manifest connection.
+        source: Which endpoint the walk draws from.
+        label: The walk's label.
+        params: Parameters this run was invoked with.
+
+    Returns:
+        The parameters the walk is bound to. For a walk seen before, these are
+        the stored filters, with any key in :data:`RANGE_PARAMS` taken from
+        ``params`` instead.
+
+    Note:
+        Filters are locked at creation. A walk's rows are only a coherent sample
+        if every page passed through the same ones, so a later run under
+        different settings would silently produce a mixed population that
+        nothing downstream could separate.
+
+        :data:`RANGE_PARAMS` are exempt because they bound how far a run
+        travels rather than which matches qualify. Their new values are written
+        back, so the stored record keeps describing the walk as it actually ran.
+    """
+    key = walk_key(source, label)
+    row = conn.execute("SELECT params FROM walks WHERE key = ?", (key,)).fetchone()
+    now = int(datetime.now(UTC).timestamp())
+
+    if row is not None:
+        stored = json.loads(row[0])
+        merged = {**stored, **{name: params[name] for name in RANGE_PARAMS if name in params}}
+        if merged != stored:
+            conn.execute(
+                "UPDATE walks SET params = ?, updated_at = ? WHERE key = ?",
+                (json.dumps(merged, sort_keys=True), now, key),
+            )
+            conn.commit()
+        return merged
+
+    conn.execute(
+        "INSERT INTO walks (key, source, label, params, state, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (key, source, label, json.dumps(params, sort_keys=True), WalkState.OPEN.value, now, now),
+    )
+    conn.commit()
+    return dict(params)
+
+
+def finish_walk(
+    conn: sqlite3.Connection,
+    source: str,
+    label: str,
+    reason: str,
+    pages_done: int,
+) -> None:
+    """Record how a walk's run ended.
+
+    Args:
+        conn: Open manifest connection.
+        source: Which endpoint the walk draws from.
+        label: The walk's label.
+        reason: One of the ``STOP_*`` constants.
+        pages_done: Pages completed across the walk's lifetime, cumulative.
+
+    Note:
+        ``pages_done`` accumulates rather than replacing, so a walk resumed
+        several times reports total progress rather than the last run's.
+    """
+    state = WalkState.DONE if reason in TERMINAL_REASONS else WalkState.OPEN
+    conn.execute(
+        "UPDATE walks SET state = ?, reason = ?, pages_done = pages_done + ?, updated_at = ? "
+        "WHERE key = ?",
+        (
+            state.value,
+            reason,
+            pages_done,
+            int(datetime.now(UTC).timestamp()),
+            walk_key(source, label),
+        ),
+    )
+    conn.commit()
+
+
+def get_walk(conn: sqlite3.Connection, selector: str) -> dict[str, object] | None:
+    """Look up one walk's stored record.
+
+    Args:
+        conn: Open manifest connection.
+        selector: ``"label"`` or ``"source:label"``.
+
+    Returns:
+        The walk's record, or ``None`` when no walk matches.
+
+    Raises:
+        ValueError: If the selector is malformed, or if a bare label is
+            ambiguous across sources -- resuming the wrong one would append to
+            an unrelated sample.
+    """
+    source, label = parse_walk(selector)
+    if source is None:
+        rows = conn.execute("SELECT * FROM walks WHERE label = ?", (label,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM walks WHERE source = ? AND label = ?", (source, label)
+        ).fetchall()
+
+    if not rows:
+        return None
+    if len(rows) > 1:
+        keys = ", ".join(row[0] for row in rows)
+        raise ValueError(f"{label!r} is ambiguous; qualify it as one of: {keys}")
+
+    columns = [column[0] for column in conn.execute("SELECT * FROM walks LIMIT 0").description]
+    record = dict(zip(columns, rows[0], strict=True))
+    record["params"] = json.loads(record["params"])
+    return record
+
+
+def list_walks(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    """List every registered walk, most recently updated first.
+
+    Args:
+        conn: Open manifest connection.
+
+    Returns:
+        One record per walk, with ``params`` decoded.
+    """
+    columns = [column[0] for column in conn.execute("SELECT * FROM walks LIMIT 0").description]
+    records = []
+    for row in conn.execute("SELECT * FROM walks ORDER BY updated_at DESC"):
+        record = dict(zip(columns, row, strict=True))
+        record["params"] = json.loads(record["params"])
+        records.append(record)
+    return records
 
 
 def parse_walk(selector: str) -> tuple[str | None, str]:
@@ -329,10 +526,12 @@ def remove_walks(
             cursors += conn.execute(
                 "DELETE FROM cursors WHERE key LIKE '%:' || ?", (label,)
             ).rowcount
+            conn.execute("DELETE FROM walks WHERE label = ?", (label,))
         else:
             cursors += conn.execute(
-                "DELETE FROM cursors WHERE key = ?", (f"{source}:{label}",)
+                "DELETE FROM cursors WHERE key = ?", (walk_key(source, label),)
             ).rowcount
+            conn.execute("DELETE FROM walks WHERE key = ?", (walk_key(source, label),))
     conn.commit()
 
     tally["deleted"] = max(deleted, 0)
