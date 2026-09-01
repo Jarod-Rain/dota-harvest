@@ -275,8 +275,8 @@ def _resume_walk(
     if walk["state"] == WalkState.DONE:
         print(f"walk '{walk['key']}' already finished ({walk['reason']}).")
         print("Nothing left to collect under its parameters.")
-        if until_ts is not None and _extends_floor(walk["params"]["until_ts"], until_ts):  # pyright: ignore[reportIndexIssue]
-            print(f"To carry it further back, start a new walk with --until {fmt_date(until_ts)}.")
+        if until_ts is not None and _extends_floor(walk["params"]["until_ts"], until_ts):  # pyright: ignore[reportArgumentType, reportIndexIssue]
+            print(f"To carry it further back, start a new walk with --until {fmt_date(until_ts)}.")  # pyright: ignore[reportArgumentType]
         return
 
     params = walk["params"]
@@ -300,7 +300,7 @@ def _resume_walk(
 
     # Raising the floor cannot un-collect what the walk already has, so the
     # rows below the new floor stay. Say so rather than implying a clean trim.
-    if until_ts not in (None, UNLIMITED) and not _extends_floor(params["until_ts"], run_until):  # pyright: ignore[reportIndexIssue]
+    if until_ts not in (None, UNLIMITED) and not _extends_floor(params["until_ts"], run_until):  # pyright: ignore[reportArgumentType, reportIndexIssue]
         print(
             "  note: raising --until only stops this run earlier; matches already "
             "collected below it remain in the walk."
@@ -310,9 +310,9 @@ def _resume_walk(
     discover.run(
         source=params["source"],  # pyright: ignore[reportIndexIssue]
         min_rank=params["min_rank"],  # pyright: ignore[reportIndexIssue]
-        pages=run_pages,  # pyright: ignore[reportIndexIssue]
+        pages=run_pages,  # pyright: ignore[reportArgumentType]
         label=walk["label"],  # pyright: ignore[reportArgumentType]
-        until_ts=run_until,
+        until_ts=run_until,  # pyright: ignore[reportArgumentType]
         sample=params["sample"],  # pyright: ignore[reportIndexIssue]
         ranked_only=params["ranked_only"],  # pyright: ignore[reportIndexIssue]
         min_age_hours=params["min_age_hours"],  # pyright: ignore[reportIndexIssue]

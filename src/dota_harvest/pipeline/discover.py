@@ -580,7 +580,7 @@ def _walk_pages(
     total_new = 0
     stop_reason = STOP_PAGE_BUDGET
     page = 0
-    while pages is UNLIMITED_PAGES or page < pages:
+    while pages is UNLIMITED_PAGES or page < pages:  # pyright: ignore[reportOperatorIssue]
         try:
             rows = discover_page(source, cursor, min_rank)
         except QuotaExhaustedError as exc:
