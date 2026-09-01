@@ -38,8 +38,8 @@ SECONDS_PER_DAY: Final[int] = 86_400
 #: Bytes per gigabyte, for the raw-collection size readout.
 BYTES_PER_GB: Final[float] = 1e9
 
-#: Pages a discovery run requests when --pages is not given.
-DEFAULT_PAGES: Final[int] = 3000
+#: Daily API calls a run leaves unspent when --reserve is not given.
+DEFAULT_RESERVE: Final[int] = 50
 
 
 def fraction(value: str) -> float:
@@ -87,54 +87,69 @@ TUNING_FLAGS: Final[tuple[str, ...]] = (
     "--all-lobbies",
     "--min-age-hours",
     "--no-seek",
-    "--reserve",
 )
 
 #: Flags a resume may override. These bound how far a run travels rather than
 #: which matches qualify, so changing one extends or shortens the walk without
 #: making its rows heterogeneous.
-RESUMABLE_OVERRIDES: Final[tuple[str, ...]] = ("--pages", "--until")
+RESUMABLE_OVERRIDES: Final[tuple[str, ...]] = ("--pages", "--until", "--reserve", "--continuous")
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
     """Build the match-id sampling frame, or resume an unfinished walk."""
     if args.resume:
-        _resume_walk(args.resume, pages=args.pages, until_ts=args.until)
+        _resume_walk(
+            args.resume,
+            pages=args.pages,
+            until_ts=args.until,
+            reserve=args.reserve,
+            continuous=args.continuous,
+        )
         return
 
     discover.run(
         source=args.source,
         min_rank=args.min_rank,
-        pages=DEFAULT_PAGES if args.pages is None else args.pages,
+        pages=args.pages,
         start_before=args.start_before,
         label=args.label,
         until_ts=args.until,
         sample=args.sample,
         ranked_only=not args.all_lobbies,
         min_age_hours=args.min_age_hours,
-        reserve=args.reserve,
+        reserve=DEFAULT_RESERVE if args.reserve is None else args.reserve,
         seek=not args.no_seek,
+        continuous=args.continuous,
     )
 
 
-def _resume_walk(selector: str, pages: int | None = None, until_ts: int | None = None) -> None:
+def _resume_walk(
+    selector: str,
+    pages: int | None = None,
+    until_ts: int | None = None,
+    reserve: int | None = None,
+    continuous: bool = False,
+) -> None:
     """Continue an unfinished walk, optionally widening how far it runs.
 
     Args:
         selector: ``"label"`` or ``"source:label"`` naming the walk.
         pages: Page budget for this run, overriding the stored one.
         until_ts: Floor for this run, overriding the stored one.
+        reserve: Daily-call headroom for this run, overriding the stored one.
+        continuous: Sleep through each quota reset instead of stopping.
 
     Raises:
         SystemExit: If no walk matches, the label is ambiguous across sources,
             or the walk has already finished.
 
     Note:
-        Every *filter* comes from the stored record; only the two range bounds
-        may be overridden. ``--pages`` is a per-run budget and ``--until`` is a
-        boundary the walk travels toward, so neither changes whether a given
-        match qualifies -- unlike ``--min-rank`` or ``--sample``, which would
-        leave the label holding two differently-filtered populations.
+        Every *filter* comes from the stored record; only the range and pacing
+        bounds may be overridden. ``--pages`` is a per-run budget, ``--until``
+        is a boundary the walk travels toward, and ``--reserve`` only decides
+        when to stop for the day -- none changes whether a given match
+        qualifies, unlike ``--min-rank`` or ``--sample``, which would leave the
+        label holding two differently-filtered populations.
     """
     conn = connect()
     try:
@@ -160,9 +175,12 @@ def _resume_walk(selector: str, pages: int | None = None, until_ts: int | None =
 
     run_pages = params["pages"] if pages is None else pages  # pyright: ignore[reportIndexIssue]
     run_until = params["until_ts"] if until_ts is None else until_ts  # pyright: ignore[reportIndexIssue]
+    run_reserve = params["reserve"] if reserve is None else reserve  # pyright: ignore[reportIndexIssue]
+    run_continuous = continuous or bool(params.get("continuous"))  # pyright: ignore[reportAttributeAccessIssue]
     for name, stored, supplied in (
         ("pages", params["pages"], run_pages),  # pyright: ignore[reportIndexIssue]
         ("until", params["until_ts"], run_until),  # pyright: ignore[reportIndexIssue]
+        ("reserve", params["reserve"], run_reserve),  # pyright: ignore[reportIndexIssue]
     ):
         if supplied != stored:
             shown_old = fmt_date(stored) if name == "until" and stored else stored
@@ -187,8 +205,9 @@ def _resume_walk(selector: str, pages: int | None = None, until_ts: int | None =
         sample=params["sample"],  # pyright: ignore[reportIndexIssue]
         ranked_only=params["ranked_only"],  # pyright: ignore[reportIndexIssue]
         min_age_hours=params["min_age_hours"],  # pyright: ignore[reportIndexIssue]
-        reserve=params["reserve"],  # pyright: ignore[reportIndexIssue]
+        reserve=run_reserve,  # pyright: ignore[reportArgumentType]
         seek=params["seek"],  # pyright: ignore[reportIndexIssue]
+        continuous=run_continuous,
     )
 
 
@@ -436,13 +455,15 @@ def main() -> None:
         help="rank tier: 1x=Herald, 2x=Guardian, ... , "
         "8x=Immortal; x=star value [1-5]. Default 11 (no minimum).",
     )
-    # Defaults to None rather than DEFAULT_PAGES so a resume can tell an
-    # explicit --pages from an untouched one and fall back to the stored value.
+    # Defaults to None so a resume can tell an explicit --pages from an
+    # untouched one, and so an unbounded run is the default: with no page cap,
+    # only --until (or the archive itself) ends the walk.
     d.add_argument(
         "--pages",
         type=int,
         default=None,
-        help=f"100 ids per page. Default {DEFAULT_PAGES}.",
+        help="stop after this many pages of 100 ids. Default is unlimited: "
+        "the walk runs until --until, the end of the archive, or Ctrl-C.",
     )
     d.add_argument("--start-before", type=int, default=None)
     d.add_argument(
@@ -478,9 +499,17 @@ def main() -> None:
     d.add_argument(
         "--reserve",
         type=int,
-        default=50,
-        help="stop with this many daily API calls unspent, leaving "
-        "headroom for reference/probe commands",
+        default=None,
+        help=f"stop with this many daily API calls unspent, leaving headroom "
+        f"for reference/probe commands. Default {DEFAULT_RESERVE}. May be "
+        f"changed when resuming.",
+    )
+    d.add_argument(
+        "--continuous",
+        action="store_true",
+        help="keep going across daily quota resets: when the budget runs out, "
+        "sleep until it returns and carry on. Requires --until or --pages so "
+        "the run has a defined end. Ctrl-C always stops it.",
     )
     d.add_argument(
         "--resume",
@@ -581,8 +610,17 @@ def main() -> None:
                 f"--resume cannot be combined with {', '.join(supplied)}. "
                 f"A walk's filters are locked when it is created; omit the flag to "
                 f"resume, or use --label to start a new walk. "
-                f"({' and '.join(RESUMABLE_OVERRIDES)} may be changed on a resume.)"
+                f"({', '.join(RESUMABLE_OVERRIDES)} may be changed on a resume.)"
             )
+
+    # A continuous run sleeps through every quota reset, so without a bound it
+    # would never stop on its own. A resume inherits the stored --until, which
+    # counts; only a fresh walk has to say so up front.
+    if getattr(a, "continuous", False) and not a.resume and a.until is None and a.pages is None:
+        ap.error(
+            "--continuous needs --until or --pages to bound the run, otherwise "
+            "it never stops on its own. (Ctrl-C always stops it.)"
+        )
     a.fn(a)
 
 

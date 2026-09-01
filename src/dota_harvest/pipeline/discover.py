@@ -15,6 +15,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Final
 
@@ -87,6 +88,18 @@ SEEK_TOLERANCE_HOURS: Final[float] = 1.0
 #: Fallback id-per-second rate if a page is too uniform to measure one
 DEFAULT_ID_RATE: Final[float] = 30.0
 
+#: ``pages=None`` means run until some other bound stops the walk.
+UNLIMITED_PAGES: Final[None] = None
+
+#: Slack added after the quota's UTC-midnight reset before waking. The counter
+#: is undocumented, so a few minutes guards against a server clock that differs
+#: from ours or a reset applied slightly late.
+QUOTA_RESET_MARGIN_S: Final[int] = 300
+
+#: Longest a single continuous sleep may last, as a sanity bound: a full day
+#: plus the margin. A computed wait beyond this means the clock is wrong.
+MAX_QUOTA_SLEEP_S: Final[int] = 24 * 3600 + QUOTA_RESET_MARGIN_S
+
 _INSERT_SQL: Final[str] = (
     "INSERT OR IGNORE INTO matches "
     "(match_id, source, label, start_time, avg_rank_tier, lobby_type, game_mode, discovered_at) "
@@ -113,6 +126,53 @@ def discover_page(source: str, less_than: int | None, min_rank: int) -> list[Mat
     if source == Source.PUBLIC:
         params["min_rank"] = min_rank
     return opendota_get(endpoint, params)
+
+
+def seconds_until_quota_reset(now: float | None = None) -> float:
+    """Seconds to wait for OpenDota's daily counter to roll over.
+
+    Args:
+        now: Unix time to measure from. Defaults to the current time.
+
+    Returns:
+        Seconds until the next UTC midnight, plus
+        :data:`QUOTA_RESET_MARGIN_S` of slack, clamped to
+        :data:`MAX_QUOTA_SLEEP_S`.
+
+    Note:
+        Nothing in the response says when the window resets, and the daily
+        counter is undocumented -- OpenDota publishes only monthly and
+        per-minute limits. UTC midnight is the observed boundary, so the
+        margin absorbs a server clock that disagrees slightly with ours.
+    """
+    moment = datetime.fromtimestamp(time.time() if now is None else now, UTC)
+    tomorrow = (moment + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    wait = (tomorrow - moment).total_seconds() + QUOTA_RESET_MARGIN_S
+    return min(max(wait, 0.0), MAX_QUOTA_SLEEP_S)
+
+
+def _sleep_until_quota_reset(key: str) -> None:
+    """Block until the daily quota is expected to be available again.
+
+    Args:
+        key: The walk's identifier, named in the log so a long sleep in a
+            multi-walk session is attributable.
+
+    Note:
+        Prints the wake time before sleeping. An unattended job that goes quiet
+        for hours is indistinguishable from a hung one otherwise, and Ctrl-C
+        remains the way to stop it.
+    """
+    wait = seconds_until_quota_reset()
+    wake = datetime.fromtimestamp(time.time() + wait, UTC)
+    hours, remainder = divmod(int(wait), 3600)
+    print(
+        f"\nsleeping {hours}h {remainder // 60:02d}m until "
+        f"{wake:%Y-%m-%d %H:%M} UTC for the quota to reset, then continuing "
+        f"'{key}' (Ctrl-C to stop)",
+        flush=True,
+    )
+    time.sleep(wait)
 
 
 def _is_sampled(match_id: int, sample: float) -> bool:
@@ -342,7 +402,7 @@ def record_matches(conn: sqlite3.Connection, rows: list[MatchRow], source: str, 
 def run(
     source: str = Source.PUBLIC,
     min_rank: int = 75,
-    pages: int = 3000,
+    pages: int | None = UNLIMITED_PAGES,
     start_before: int | None = None,
     label: str = "main",
     until_ts: int | None = None,
@@ -351,13 +411,15 @@ def run(
     min_age_hours: float = MIN_MATCH_AGE_HOURS,
     reserve: int = 50,
     seek: bool = True,
+    continuous: bool = False,
 ) -> int:
     """Walk a discovery endpoint backwards, recording match ids in the manifest.
 
     Args:
         source: ``"public"`` or ``"pro"``.
         min_rank: Rank-tier floor, e.g. 75 for Divine and above.
-        pages: Maximum pages to request; each yields up to 100 ids.
+        pages: Maximum pages to request; each yields up to 100 ids. ``None``
+            runs until another bound stops the walk.
         start_before: Begin below this match id, overriding the saved cursor.
         label: Names this walk's cursor. Use a distinct label per backfill.
         until_ts: Stop once the walk reaches matches older than this.
@@ -368,6 +430,8 @@ def run(
         reserve: Stop with this many daily API calls unspent.
         seek: Jump straight to the collectable window on a fresh walk rather
             than paging through matches too new to keep.
+        continuous: Sleep through each daily quota reset and carry on, instead
+            of stopping when the budget runs out.
 
     Returns:
         The count of new match ids recorded this run.
@@ -394,6 +458,7 @@ def run(
             "min_age_hours": min_age_hours,
             "reserve": reserve,
             "seek": seek,
+            "continuous": continuous,
         },
     )
     min_rank = locked["min_rank"]  # pyright: ignore[reportAssignmentType]
@@ -404,22 +469,12 @@ def run(
     min_age_hours = locked["min_age_hours"]  # pyright: ignore[reportAssignmentType]
     reserve = locked["reserve"]  # pyright: ignore[reportAssignmentType]
     seek = locked["seek"]  # pyright: ignore[reportAssignmentType]
+    continuous = locked.get("continuous", continuous)  # pyright: ignore[reportAssignmentType]
 
     # Forward collection and historical backfill are independent walks over the same source.
     key = f"{source}:{label}"
     cursor = start_before or get_cursor(conn, key)
     age_cutoff = time.time() - min_age_hours * SECONDS_PER_HOUR
-
-    # Seek on a fresh walk, and also on a resumed one still stranded above the cutoff
-    if seek and start_before is None and min_age_hours > 0:
-        entry, probes = seek_to_age_cutoff(source, min_rank, age_cutoff)
-        if entry is not None and (cursor is None or entry < cursor):
-            resumed = "" if cursor is None else f" (was stalled at {cursor:,})"
-            cursor = entry
-            print(
-                f"seeked to the {min_age_hours:g}h cutoff in {probes} calls -> {cursor:,}{resumed}"
-            )
-    print(f"walk '{key}' " + (f"resuming from {cursor:,}" if cursor else "from newest"))
 
     # Progress is reported through a mutable counter rather than a return
     # value, so an interrupt mid-page still credits the pages already finished.
@@ -427,6 +482,20 @@ def run(
     total_new = 0
     stop_reason = STOP_PAGE_BUDGET
     try:
+        # The seek is inside the try because it spends API calls too: an
+        # interrupt during it must still land in the record, or the walk keeps
+        # a stale reason from whenever it last completed.
+        if seek and start_before is None and min_age_hours > 0:
+            entry, probes = seek_to_age_cutoff(source, min_rank, age_cutoff)
+            if entry is not None and (cursor is None or entry < cursor):
+                resumed = "" if cursor is None else f" (was stalled at {cursor:,})"
+                cursor = entry
+                print(
+                    f"seeked to the {min_age_hours:g}h cutoff in "
+                    f"{probes} calls -> {cursor:,}{resumed}"
+                )
+        print(f"walk '{key}' " + (f"resuming from {cursor:,}" if cursor else "from newest"))
+
         total_new, stop_reason = _walk_pages(  # pyright: ignore[reportAssignmentType]
             conn,
             progress,
@@ -442,6 +511,7 @@ def run(
             min_age_hours=min_age_hours,
             reserve=reserve,
             seek=seek,
+            continuous=continuous,
         )
     except KeyboardInterrupt:
         # Ctrl-C must still land in the record. Without this the walk keeps
@@ -473,14 +543,15 @@ def _walk_pages(
     source: str,
     label: str,
     min_rank: int,
-    pages: int,
+    pages: int | None,
     until_ts: int | None,
     sample: float,
     ranked_only: bool,
     min_age_hours: float,
     reserve: int,
     seek: bool,
-) -> tuple[int, int, str]:
+    continuous: bool = False,
+) -> tuple[int, str]:
     """Page backwards through the endpoint, recording matches as it goes.
 
     Args:
@@ -499,6 +570,8 @@ def _walk_pages(
         min_age_hours: Skip matches younger than this.
         reserve: Stop with this many daily API calls unspent.
         seek: Whether the caller seeked; only affects a hint message.
+        continuous: Sleep through a spent quota rather than stopping.
+        continuous: Sleep through a spent quota rather than stopping.
 
     Returns:
         A ``(new_ids, stop_reason)`` pair. The caller records the reason, so
@@ -506,10 +579,17 @@ def _walk_pages(
     """
     total_new = 0
     stop_reason = STOP_PAGE_BUDGET
-    for page in range(pages):
+    page = 0
+    while pages is UNLIMITED_PAGES or page < pages:
         try:
             rows = discover_page(source, cursor, min_rank)
         except QuotaExhaustedError as exc:
+            if continuous:
+                # The cursor is committed per page, so sleeping and retrying
+                # picks up exactly where this attempt stopped.
+                print(f"\n{exc}")
+                _sleep_until_quota_reset(key)
+                continue
             # The cursor is already saved from the previous page, so re-running
             # this same command tomorrow resumes exactly here.
             print(f"\n{exc}")
@@ -517,6 +597,7 @@ def _walk_pages(
             print(f"resume with: dota-harvest discover --resume {key}")
             stop_reason = STOP_QUOTA
             break
+        page += 1
 
         if not rows:
             print("no more results")
@@ -557,8 +638,8 @@ def _walk_pages(
         left = quota_for(OPENDOTA_URL).get("day")
         budget = f", {left} left today" if left is not None else ""
         print(
-            f"  page {page + 1}/{pages}: {len(rows)} returned, {len(kept)} kept, "
-            f"at {fmt_date(oldest)}{budget}"
+            f"  page {page}/{'inf' if pages is UNLIMITED_PAGES else pages}: "
+            f"{len(rows)} returned, {len(kept)} kept, at {fmt_date(oldest)}{budget}"
         )
         if dropped:
             summary = ", ".join(f"{count} {reason}" for reason, count in dropped.most_common())
@@ -575,6 +656,9 @@ def _walk_pages(
 
         if left is not None and left <= reserve:
             print(f"\ndaily quota nearly spent ({left} left, reserve={reserve}).")
+            if continuous:
+                _sleep_until_quota_reset(key)
+                continue
             print(f"resume tomorrow with: dota-harvest discover --resume {key}")
             stop_reason = STOP_RESERVE
             break

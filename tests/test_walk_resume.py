@@ -197,8 +197,9 @@ def test_walk_key_matches_the_cursor_format(conn):
 # --- range overrides -----------------------------------------------------
 
 
-def test_range_params_are_exactly_pages_and_until():
-    assert frozenset({"pages", "until_ts"}) == RANGE_PARAMS
+def test_range_params_are_the_bounds_and_pacing_knobs():
+    """Everything else decides the population and stays locked."""
+    assert frozenset({"pages", "until_ts", "reserve"}) == RANGE_PARAMS
 
 
 def test_resuming_may_change_the_page_budget(conn):
@@ -278,3 +279,24 @@ def test_progress_starts_at_zero_and_accumulates():
     progress.pages += 1
     progress.pages += 1
     assert progress.pages == 2
+
+
+def test_resuming_may_change_the_reserve(conn):
+    """--reserve paces the run; it does not decide which matches qualify."""
+    start_walk(conn, "public", "alpha", PARAMS)
+    returned = start_walk(conn, "public", "alpha", {**PARAMS, "reserve": 200})
+    assert returned["reserve"] == 200
+    assert get_walk(conn, "alpha")["params"]["reserve"] == 200
+
+
+def test_reserve_override_leaves_filters_locked(conn):
+    start_walk(conn, "public", "alpha", PARAMS)
+    returned = start_walk(conn, "public", "alpha", {**PARAMS, "reserve": 200, "min_rank": 99})
+    assert returned["reserve"] == 200
+    assert returned["min_rank"] == 60
+
+
+def test_an_unlimited_page_budget_round_trips(conn):
+    """None must survive JSON storage, since the loop tests identity against it."""
+    start_walk(conn, "public", "alpha", {**PARAMS, "pages": None})
+    assert get_walk(conn, "alpha")["params"]["pages"] is None

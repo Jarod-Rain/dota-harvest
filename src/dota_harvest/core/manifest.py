@@ -206,10 +206,13 @@ STOP_INTERRUPTED: Final[str] = "interrupted"
 #: Stop reasons that mean the walk has nothing left to collect.
 TERMINAL_REASONS: Final[frozenset[str]] = frozenset({STOP_REACHED_FLOOR, STOP_ARCHIVE_EXHAUSTED})
 
-#: Parameters that bound how far a run travels rather than which matches it
-#: keeps. A resume may change these without making the walk's rows
-#: heterogeneous, so they are not locked; everything else is.
-RANGE_PARAMS: Final[frozenset[str]] = frozenset({"pages", "until_ts"})
+#: Parameters that bound how far a run travels, or how it paces itself, rather
+#: than which matches it keeps. A resume may change these without making the
+#: walk's rows heterogeneous, so they are not locked; everything else is.
+#:
+#: ``reserve`` qualifies because it only decides when to stop for the day: it
+#: throttles the run without touching the population it collects.
+RANGE_PARAMS: Final[frozenset[str]] = frozenset({"pages", "until_ts", "reserve"})
 
 
 def walk_key(source: str, label: str) -> str:
