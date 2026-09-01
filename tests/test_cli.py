@@ -6,7 +6,7 @@ import argparse
 
 import pytest
 
-from dota_harvest.cli.main import RESUMABLE_OVERRIDES, TUNING_FLAGS, fraction
+from dota_harvest.cli.main import RESUMABLE_OVERRIDES, TUNING_FLAGS, UNLIMITED, fraction
 
 
 @pytest.mark.parametrize("value", ["1", "0.5", "0.01", "1.0"])
@@ -75,3 +75,33 @@ def test_range_overrides_are_not_tuning_flags():
 def test_a_walk_value_named_like_a_flag_is_not_a_conflict():
     """The selector itself must not be mistaken for a tuning flag."""
     assert _resume_conflicts(["discover", "--resume", "public:demo"]) == []
+
+
+@pytest.mark.parametrize("command", ["status", "paths", "transform", "check", "remove"])
+def test_the_continuous_bound_check_tolerates_other_subcommands(command):
+    """Other subcommands must survive the --continuous bound check.
+
+    It reads --until/--pages, which only `discover` defines, so reading them
+    unguarded raised AttributeError on every other subcommand.
+    """
+    args = argparse.Namespace(cmd=command)  # no until/pages/resume/continuous
+    unbounded = getattr(args, "until", None) in (None, UNLIMITED) and getattr(
+        args, "pages", None
+    ) in (None, UNLIMITED)
+    assert unbounded is True
+    assert getattr(args, "continuous", False) is False
+
+
+def test_continuous_needs_a_bound_only_on_a_fresh_walk():
+    """A resume inherits the stored --until, so it needs no bound up front."""
+    resuming = argparse.Namespace(continuous=True, resume="demo", until=None, pages=None)
+    fresh = argparse.Namespace(continuous=True, resume=None, until=None, pages=None)
+
+    def needs_bound(a):
+        unbounded = getattr(a, "until", None) in (None, UNLIMITED) and getattr(
+            a, "pages", None
+        ) in (None, UNLIMITED)
+        return getattr(a, "continuous", False) and not getattr(a, "resume", None) and unbounded
+
+    assert needs_bound(fresh) is True
+    assert needs_bound(resuming) is False

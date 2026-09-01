@@ -7,12 +7,21 @@ multi-day backfill silently.
 
 from __future__ import annotations
 
+import argparse
 from datetime import UTC, datetime
 
 import pytest
 
-from dota_harvest.cli.main import RESUMABLE_OVERRIDES, TUNING_FLAGS
-from dota_harvest.core.manifest import RANGE_PARAMS
+from dota_harvest.cli.main import (
+    RESUMABLE_OVERRIDES,
+    TUNING_FLAGS,
+    UNLIMITED,
+    _resolve_bound,
+    _show_bound,
+    date_floor,
+    page_budget,
+)
+from dota_harvest.core.manifest import RANGE_PARAMS, parse_date
 from dota_harvest.pipeline.discover import (
     MAX_QUOTA_SLEEP_S,
     QUOTA_RESET_MARGIN_S,
@@ -106,3 +115,71 @@ def test_filters_remain_locked():
 
 def test_the_two_flag_sets_stay_disjoint():
     assert not set(TUNING_FLAGS) & set(RESUMABLE_OVERRIDES)
+
+
+# --- clearing a stored bound --------------------------------------------
+
+
+@pytest.mark.parametrize("word", ["unlimited", "none", "inf", "all", "UNLIMITED", " Inf "])
+def test_unlimited_words_parse_to_the_sentinel(word):
+    """Case and surrounding space must not matter to an operator typing it."""
+    assert page_budget(word) is UNLIMITED
+    assert date_floor(word) is UNLIMITED
+
+
+def test_a_page_count_parses_normally():
+    assert page_budget("25") == 25
+
+
+def test_a_date_parses_normally():
+    assert date_floor("2026-08-25") == parse_date("2026-08-25")
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "abc", ""])
+def test_page_budget_rejects_nonsense(bad):
+    with pytest.raises(argparse.ArgumentTypeError):
+        page_budget(bad)
+
+
+def test_zero_pages_points_at_the_right_flag():
+    """`--pages 0` reads as 'no limit' but would collect nothing."""
+    with pytest.raises(argparse.ArgumentTypeError, match="unlimited"):
+        page_budget("0")
+
+
+@pytest.mark.parametrize("bad", ["not-a-date", "2026-13-45", ""])
+def test_date_floor_rejects_nonsense(bad):
+    with pytest.raises(argparse.ArgumentTypeError):
+        date_floor(bad)
+
+
+def test_omitting_a_flag_keeps_the_stored_bound():
+    """None means 'not supplied', which must leave the walk's value alone."""
+    assert _resolve_bound(20, None) == 20
+    assert _resolve_bound(None, None) is None
+
+
+def test_the_sentinel_clears_the_stored_bound():
+    """The gap this closes: previously no value could express 'remove it'."""
+    assert _resolve_bound(20, UNLIMITED) is None
+    assert _resolve_bound(1_700_000_000, UNLIMITED) is None
+
+
+def test_a_concrete_value_replaces_the_stored_bound():
+    assert _resolve_bound(20, 50) == 50
+
+
+def test_none_and_the_sentinel_resolve_oppositely():
+    """They are both 'falsy-ish' but mean opposite things, so keep them apart."""
+    assert _resolve_bound(20, None) != _resolve_bound(20, UNLIMITED)
+
+
+def test_an_absent_bound_displays_as_unlimited():
+    """`pages=None` in status would read as a bug rather than a setting."""
+    assert _show_bound("pages", None) == "unlimited"
+    assert _show_bound("until", None) == "unlimited"
+
+
+def test_a_present_bound_displays_its_value():
+    assert _show_bound("pages", 20) == "20"
+    assert _show_bound("until", parse_date("2026-08-25")) == "2026-08-25"

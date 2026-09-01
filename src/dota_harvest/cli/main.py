@@ -70,6 +70,115 @@ def fraction(value: str) -> float:
     return parsed
 
 
+#: Values that spell "no limit" for --pages and --until. Spelling it out is the
+#: only way a resume can distinguish "leave the stored bound alone" (the flag
+#: was omitted) from "remove the stored bound" -- both of which are otherwise
+#: just ``None``.
+UNLIMITED_WORDS: Final[frozenset[str]] = frozenset({"none", "unlimited", "inf", "all"})
+
+
+class Unlimited:
+    """Sentinel for a bound the caller explicitly wants removed.
+
+    Distinct from ``None``, which means the flag was not given at all. A resume
+    treats the two oppositely: ``None`` keeps whatever the walk already had,
+    while this clears it.
+    """
+
+    def __repr__(self) -> str:
+        """Render as the word a caller would type."""
+        return "unlimited"
+
+
+#: Singleton, so callers can compare with ``is``.
+UNLIMITED: Final[Unlimited] = Unlimited()
+
+
+def page_budget(value: str) -> int | Unlimited:
+    """Parse ``--pages``, allowing a word that removes the limit.
+
+    Args:
+        value: Raw command-line text: a positive integer, or one of
+            :data:`UNLIMITED_WORDS`.
+
+    Returns:
+        The page count, or :data:`UNLIMITED` to run without a page bound.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is neither.
+    """
+    if value.strip().lower() in UNLIMITED_WORDS:
+        return UNLIMITED
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a page count or {'/'.join(sorted(UNLIMITED_WORDS))}"
+        ) from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be at least 1 page, got {parsed} (use --pages unlimited to remove the limit)"
+        )
+    return parsed
+
+
+def date_floor(value: str) -> int | Unlimited:
+    """Parse ``--until``, allowing a word that removes the floor.
+
+    Args:
+        value: ``YYYY-MM-DD``, or one of :data:`UNLIMITED_WORDS`.
+
+    Returns:
+        A UTC Unix timestamp, or :data:`UNLIMITED` to run without a floor.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is neither.
+    """
+    if value.strip().lower() in UNLIMITED_WORDS:
+        return UNLIMITED
+    try:
+        return parse_date(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a YYYY-MM-DD date") from None
+
+
+def _show_bound(name: str, value: object) -> str:
+    """Render a bound for the override log.
+
+    Args:
+        name: Which bound, so ``until`` can be shown as a date.
+        value: The bound's value; ``None`` means no limit.
+
+    Returns:
+        A human-readable value, with an absent bound spelled "unlimited"
+        rather than a bare dash -- the difference matters here, since removing
+        a limit is exactly what the caller may have asked for.
+    """
+    if value is None:
+        return "unlimited"
+    if name == "until":
+        return fmt_date(value)  # pyright: ignore[reportArgumentType]
+    return str(value)
+
+
+def _resolve_bound(stored: object, supplied: object) -> object:
+    """Merge a stored bound with what this run supplied.
+
+    Args:
+        stored: The walk's recorded value.
+        supplied: ``None`` if the flag was omitted, :data:`UNLIMITED` to clear
+            the bound, or a concrete value.
+
+    Returns:
+        The value the run should use.
+    """
+    if supplied is None:
+        return stored
+    if supplied is UNLIMITED:
+        return None
+    return supplied
+
+
 def cmd_check(args: argparse.Namespace) -> None:
     """Validate the API token, the field names, and the stored collection."""
     check(args.id)
@@ -110,10 +219,10 @@ def cmd_discover(args: argparse.Namespace) -> None:
     discover.run(
         source=args.source,
         min_rank=args.min_rank,
-        pages=args.pages,
+        pages=None if args.pages is UNLIMITED else args.pages,
         start_before=args.start_before,
         label=args.label,
-        until_ts=args.until,
+        until_ts=None if args.until is UNLIMITED else args.until,
         sample=args.sample,
         ranked_only=not args.all_lobbies,
         min_age_hours=args.min_age_hours,
@@ -125,8 +234,8 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
 def _resume_walk(
     selector: str,
-    pages: int | None = None,
-    until_ts: int | None = None,
+    pages: int | Unlimited | None = None,
+    until_ts: int | Unlimited | None = None,
     reserve: int | None = None,
     continuous: bool = False,
 ) -> None:
@@ -135,7 +244,9 @@ def _resume_walk(
     Args:
         selector: ``"label"`` or ``"source:label"`` naming the walk.
         pages: Page budget for this run, overriding the stored one.
+            :data:`UNLIMITED` removes a limit the walk was created with.
         until_ts: Floor for this run, overriding the stored one.
+            :data:`UNLIMITED` removes a floor the walk was created with.
         reserve: Daily-call headroom for this run, overriding the stored one.
         continuous: Sleep through each quota reset instead of stopping.
 
@@ -173,8 +284,8 @@ def _resume_walk(
     print(f"  stopped: {walk['reason'] or 'not yet run'}")
     print(f"  {_format_params(params)}")  # pyright: ignore[reportArgumentType]
 
-    run_pages = params["pages"] if pages is None else pages  # pyright: ignore[reportIndexIssue]
-    run_until = params["until_ts"] if until_ts is None else until_ts  # pyright: ignore[reportIndexIssue]
+    run_pages = _resolve_bound(params["pages"], pages)  # pyright: ignore[reportIndexIssue]
+    run_until = _resolve_bound(params["until_ts"], until_ts)  # pyright: ignore[reportIndexIssue]
     run_reserve = params["reserve"] if reserve is None else reserve  # pyright: ignore[reportIndexIssue]
     run_continuous = continuous or bool(params.get("continuous"))  # pyright: ignore[reportAttributeAccessIssue]
     for name, stored, supplied in (
@@ -183,13 +294,13 @@ def _resume_walk(
         ("reserve", params["reserve"], run_reserve),  # pyright: ignore[reportIndexIssue]
     ):
         if supplied != stored:
-            shown_old = fmt_date(stored) if name == "until" and stored else stored
-            shown_new = fmt_date(supplied) if name == "until" and supplied else supplied
-            print(f"  override: {name} {shown_old or '-'} -> {shown_new or '-'}")
+            print(
+                f"  override: {name} {_show_bound(name, stored)} -> {_show_bound(name, supplied)}"
+            )
 
     # Raising the floor cannot un-collect what the walk already has, so the
     # rows below the new floor stay. Say so rather than implying a clean trim.
-    if until_ts is not None and not _extends_floor(params["until_ts"], until_ts):  # pyright: ignore[reportIndexIssue]
+    if until_ts not in (None, UNLIMITED) and not _extends_floor(params["until_ts"], run_until):  # pyright: ignore[reportIndexIssue]
         print(
             "  note: raising --until only stops this run earlier; matches already "
             "collected below it remain in the walk."
@@ -239,12 +350,11 @@ def _format_params(params: dict[str, object]) -> str:
         A compact ``key=value`` summary, with the ``--until`` floor shown as a
         date rather than a raw timestamp.
     """
-    until = params.get("until_ts")
     parts = [
         f"source={params['source']}",
         f"min_rank={params['min_rank']}",
-        f"pages={params['pages']}",
-        f"until={fmt_date(until) if until else '-'}",  # pyright: ignore[reportArgumentType]
+        f"pages={_show_bound('pages', params.get('pages'))}",
+        f"until={_show_bound('until', params.get('until_ts'))}",
         f"sample={params['sample']:g}",
         f"ranked_only={params['ranked_only']}",
         f"min_age_hours={params['min_age_hours']:g}",
@@ -460,10 +570,12 @@ def main() -> None:
     # only --until (or the archive itself) ends the walk.
     d.add_argument(
         "--pages",
-        type=int,
+        type=page_budget,
         default=None,
+        metavar="N",
         help="stop after this many pages of 100 ids. Default is unlimited: "
-        "the walk runs until --until, the end of the archive, or Ctrl-C.",
+        "the walk runs until --until, the end of the archive, or Ctrl-C. "
+        "Pass 'unlimited' to clear a limit a walk was created with.",
     )
     d.add_argument("--start-before", type=int, default=None)
     d.add_argument(
@@ -471,7 +583,14 @@ def main() -> None:
         default="main",
         help="names this walk's cursor; use a distinct label per backfill",
     )
-    d.add_argument("--until", type=parse_date, default=None, help="stop at YYYY-MM-DD")
+    d.add_argument(
+        "--until",
+        type=date_floor,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="stop once the walk reaches matches older than this date. "
+        "Pass 'unlimited' to clear a floor a walk was created with.",
+    )
     d.add_argument(
         "--sample",
         type=fraction,
@@ -616,7 +735,11 @@ def main() -> None:
     # A continuous run sleeps through every quota reset, so without a bound it
     # would never stop on its own. A resume inherits the stored --until, which
     # counts; only a fresh walk has to say so up front.
-    if getattr(a, "continuous", False) and not a.resume and a.until is None and a.pages is None:
+    unbounded = getattr(a, "until", None) in (None, UNLIMITED) and getattr(a, "pages", None) in (
+        None,
+        UNLIMITED,
+    )
+    if getattr(a, "continuous", False) and not getattr(a, "resume", None) and unbounded:
         ap.error(
             "--continuous needs --until or --pages to bound the run, otherwise "
             "it never stops on its own. (Ctrl-C always stops it.)"
