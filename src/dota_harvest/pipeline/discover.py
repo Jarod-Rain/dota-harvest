@@ -20,13 +20,14 @@ from enum import StrEnum
 from typing import Any, Final
 
 from dota_harvest.api.clients import opendota_get
-from dota_harvest.api.http import QuotaExhaustedError, quota_for
+from dota_harvest.api.http import QuotaExhaustedError, RateLimitedError, quota_for
 from dota_harvest.core.config import MIN_MATCH_AGE_HOURS, OPENDOTA_URL
 from dota_harvest.core.manifest import (
     STOP_ARCHIVE_EXHAUSTED,
     STOP_INTERRUPTED,
     STOP_PAGE_BUDGET,
     STOP_QUOTA,
+    STOP_RATE_LIMITED,
     STOP_REACHED_FLOOR,
     STOP_RESERVE,
     TERMINAL_REASONS,
@@ -78,6 +79,23 @@ SECONDS_PER_HOUR: Final[int] = 3600
 
 #: Reason string for a match STRATZ has not had time to index
 TOO_NEW: Final[str] = "too new"
+
+#: Pause the walk once the per-minute allowance falls to this. Small enough
+#: that a healthy walk never pauses, large enough to absorb the seek probes and
+#: retries that share the same window.
+MIN_MINUTE_HEADROOM: Final[int] = 3
+
+#: How long to wait for a per-minute window to roll over, with margin.
+MINUTE_WINDOW_PAUSE_S: Final[float] = 65.0
+
+#: Added to a rate-limit pause so the window has demonstrably rolled over
+#: before the next request, rather than landing on its final second.
+RATE_LIMIT_PAUSE_MARGIN_S: Final[float] = 5.0
+
+#: Consecutive rate-limit pauses tolerated before a walk gives up. A block that
+#: survives this many full windows is not a passing burst, and continuing would
+#: hammer an API that has made its position clear.
+MAX_CONSECUTIVE_STALLS: Final[int] = 5
 
 #: Probes the seek may spend locating the collectable window
 SEEK_MAX_PROBES: Final[int] = 6
@@ -580,9 +598,24 @@ def _walk_pages(
     total_new = 0
     stop_reason = STOP_PAGE_BUDGET
     page = 0
+    stalls = 0
     while pages is UNLIMITED_PAGES or page < pages:  # pyright: ignore[reportOperatorIssue]
         try:
             rows = discover_page(source, cursor, min_rank)
+        except RateLimitedError as exc:
+            # A short window outlasting the ladder is a pause, not a failure:
+            # the cursor is already committed, so waiting it out resumes here.
+            stalls += 1
+            if stalls > MAX_CONSECUTIVE_STALLS:
+                print(f"\n{exc}")
+                print(f"still blocked after {stalls} waits; stopping.")
+                print(f"resume with: dota-harvest discover --resume {key}")
+                stop_reason = STOP_RATE_LIMITED
+                break
+            wait = max(exc.retry_after, 1.0) + RATE_LIMIT_PAUSE_MARGIN_S
+            print(f"\n{exc.window}ly rate limit hit; pausing {wait:.0f}s before retrying.")
+            time.sleep(wait)
+            continue
         except QuotaExhaustedError as exc:
             if continuous:
                 # The cursor is committed per page, so sleeping and retrying
@@ -598,6 +631,7 @@ def _walk_pages(
             stop_reason = STOP_QUOTA
             break
         page += 1
+        stalls = 0  # a page got through, so the block has cleared
 
         if not rows:
             print("no more results")
@@ -653,6 +687,14 @@ def _walk_pages(
             )
             if not seek:
                 print("    drop --no-seek to jump straight to the collectable window.")
+
+        # The per-minute counter is the one that actually stops a long walk;
+        # the daily guard below never sees it. Waiting out the tail of a window
+        # costs seconds, where being blocked costs the whole retry ladder.
+        per_minute = quota_for(OPENDOTA_URL).get("minute")
+        if per_minute is not None and per_minute <= MIN_MINUTE_HEADROOM:
+            print(f"    per-minute quota low ({per_minute} left); pausing for the window")
+            time.sleep(MINUTE_WINDOW_PAUSE_S)
 
         if left is not None and left <= reserve:
             print(f"\ndaily quota nearly spent ({left} left, reserve={reserve}).")
