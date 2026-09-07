@@ -20,7 +20,13 @@ from enum import StrEnum
 from typing import Any, Final
 
 from dota_harvest.api.clients import opendota_get
-from dota_harvest.api.http import QuotaExhaustedError, RateLimitedError, quota_for
+from dota_harvest.api.http import (
+    QUOTA,
+    QuotaExhaustedError,
+    RateLimitedError,
+    host_of,
+    quota_for,
+)
 from dota_harvest.core.config import MIN_MATCH_AGE_HOURS, OPENDOTA_URL
 from dota_harvest.core.manifest import (
     STOP_ARCHIVE_EXHAUSTED,
@@ -80,6 +86,11 @@ SECONDS_PER_HOUR: Final[int] = 3600
 #: Reason string for a match STRATZ has not had time to index
 TOO_NEW: Final[str] = "too new"
 
+#: Daily calls a walk always leaves unspent, even under ``--reserve 0``.
+#: Stopping at exactly zero means the next request is already over the line, so
+#: the walk raises instead of stopping cleanly and resuming tomorrow.
+MIN_DAILY_HEADROOM: Final[int] = 2
+
 #: Pause the walk once the per-minute allowance falls to this. Small enough
 #: that a healthy walk never pauses, large enough to absorb the seek probes and
 #: retries that share the same window.
@@ -96,6 +107,11 @@ RATE_LIMIT_PAUSE_MARGIN_S: Final[float] = 5.0
 #: survives this many full windows is not a passing burst, and continuing would
 #: hammer an API that has made its position clear.
 MAX_CONSECUTIVE_STALLS: Final[int] = 5
+
+#: Quota resets a continuous run may wait through before giving up. A budget
+#: still spent after this many rollovers is not a daily limit refilling, so
+#: sleeping again would just idle indefinitely.
+MAX_QUOTA_WAITS: Final[int] = 3
 
 #: Probes the seek may spend locating the collectable window
 SEEK_MAX_PROBES: Final[int] = 6
@@ -191,6 +207,12 @@ def _sleep_until_quota_reset(key: str) -> None:
         flush=True,
     )
     time.sleep(wait)
+
+    # The cached counters describe the window that just expired. Left in place,
+    # the reserve guard re-fires on them before a single request goes out and
+    # the walk sleeps another whole day. Clearing makes the budget unknown
+    # again, so the next reply repopulates it from the server.
+    QUOTA.pop(host_of(OPENDOTA_URL), None)
 
 
 def _is_sampled(match_id: int, sample: float) -> bool:
@@ -476,7 +498,7 @@ def run(
             "min_age_hours": min_age_hours,
             "reserve": reserve,
             "seek": seek,
-            "continuous": continuous,
+            "continuous": bool(continuous),
         },
     )
     min_rank = locked["min_rank"]  # pyright: ignore[reportAssignmentType]
@@ -487,7 +509,7 @@ def run(
     min_age_hours = locked["min_age_hours"]  # pyright: ignore[reportAssignmentType]
     reserve = locked["reserve"]  # pyright: ignore[reportAssignmentType]
     seek = locked["seek"]  # pyright: ignore[reportAssignmentType]
-    continuous = locked.get("continuous", continuous)  # pyright: ignore[reportAssignmentType]
+    continuous = bool(locked.get("continuous", continuous))  # pyright: ignore[reportAssignmentType]
 
     # Forward collection and historical backfill are independent walks over the same source.
     key = f"{source}:{label}"
@@ -500,37 +522,59 @@ def run(
     total_new = 0
     stop_reason = STOP_PAGE_BUDGET
     try:
-        # The seek is inside the try because it spends API calls too: an
-        # interrupt during it must still land in the record, or the walk keeps
-        # a stale reason from whenever it last completed.
-        if seek and start_before is None and min_age_hours > 0:
-            entry, probes = seek_to_age_cutoff(source, min_rank, age_cutoff)
-            if entry is not None and (cursor is None or entry < cursor):
-                resumed = "" if cursor is None else f" (was stalled at {cursor:,})"
-                cursor = entry
-                print(
-                    f"seeked to the {min_age_hours:g}h cutoff in "
-                    f"{probes} calls -> {cursor:,}{resumed}"
-                )
-        print(f"walk '{key}' " + (f"resuming from {cursor:,}" if cursor else "from newest"))
+        waits = 0
+        while True:
+            try:
+                # The seek is inside the try because it spends API calls too: an
+                # interrupt during it must still land in the record, or the walk
+                # keeps a stale reason from whenever it last completed.
+                if seek and start_before is None and min_age_hours > 0:
+                    entry, probes = seek_to_age_cutoff(source, min_rank, age_cutoff)
+                    if entry is not None and (cursor is None or entry < cursor):
+                        resumed = "" if cursor is None else f" (was stalled at {cursor:,})"
+                        cursor = entry
+                        print(
+                            f"seeked to the {min_age_hours:g}h cutoff in "
+                            f"{probes} calls -> {cursor:,}{resumed}"
+                        )
+                print(f"walk '{key}' " + (f"resuming from {cursor:,}" if cursor else "from newest"))
 
-        total_new, stop_reason = _walk_pages(  # pyright: ignore[reportAssignmentType]
-            conn,
-            progress,
-            key=key,
-            cursor=cursor,
-            source=source,
-            label=label,
-            min_rank=min_rank,
-            pages=pages,
-            until_ts=until_ts,
-            sample=sample,
-            ranked_only=ranked_only,
-            min_age_hours=min_age_hours,
-            reserve=reserve,
-            seek=seek,
-            continuous=continuous,
-        )
+                total_new, stop_reason = _walk_pages(  # pyright: ignore[reportAssignmentType]
+                    conn,
+                    progress,
+                    key=key,
+                    cursor=cursor,
+                    source=source,
+                    label=label,
+                    min_rank=min_rank,
+                    pages=pages,
+                    until_ts=until_ts,
+                    sample=sample,
+                    ranked_only=ranked_only,
+                    min_age_hours=min_age_hours,
+                    reserve=reserve,
+                    seek=seek,
+                    continuous=continuous,
+                )
+                break
+            except QuotaExhaustedError as exc:
+                # QUOTA lives in memory, so a freshly started process cannot
+                # know the budget is gone until a request comes back 429. That
+                # lands here rather than in the page loop's own handler, which
+                # only sees exhaustion discovered mid-walk.
+                waits += 1
+                if not continuous or waits > MAX_QUOTA_WAITS:
+                    print(f"\n{exc}")
+                    if continuous:
+                        print(f"still exhausted after {waits - 1} reset(s); stopping.")
+                    print(f"resume with: dota-harvest discover --resume {key}")
+                    stop_reason = STOP_QUOTA
+                    break
+                print(f"\n{exc}")
+                _sleep_until_quota_reset(key)
+                # Re-read the cursor: the failed attempt may still have
+                # committed pages before the budget ran out.
+                cursor = start_before or get_cursor(conn, key)
     except KeyboardInterrupt:
         # Ctrl-C must still land in the record. Without this the walk keeps
         # whatever reason its previous run left -- typically "ran out of
@@ -589,7 +633,6 @@ def _walk_pages(
         reserve: Stop with this many daily API calls unspent.
         seek: Whether the caller seeked; only affects a hint message.
         continuous: Sleep through a spent quota rather than stopping.
-        continuous: Sleep through a spent quota rather than stopping.
 
     Returns:
         A ``(new_ids, stop_reason)`` pair. The caller records the reason, so
@@ -599,6 +642,7 @@ def _walk_pages(
     stop_reason = STOP_PAGE_BUDGET
     page = 0
     stalls = 0
+    waits = 0
     while pages is UNLIMITED_PAGES or page < pages:  # pyright: ignore[reportOperatorIssue]
         try:
             rows = discover_page(source, cursor, min_rank)
@@ -617,7 +661,8 @@ def _walk_pages(
             time.sleep(wait)
             continue
         except QuotaExhaustedError as exc:
-            if continuous:
+            waits += 1
+            if continuous and waits <= MAX_QUOTA_WAITS:
                 # The cursor is committed per page, so sleeping and retrying
                 # picks up exactly where this attempt stopped.
                 print(f"\n{exc}")
@@ -626,12 +671,17 @@ def _walk_pages(
             # The cursor is already saved from the previous page, so re-running
             # this same command tomorrow resumes exactly here.
             print(f"\n{exc}")
+            if continuous:
+                # A budget still empty after this many rollovers is not a daily
+                # limit refilling, so sleeping again would idle indefinitely.
+                print(f"still exhausted after {waits - 1} reset(s); stopping.")
             print(f"stopped at page {page} with {total_new} new ids this run.")
             print(f"resume with: dota-harvest discover --resume {key}")
             stop_reason = STOP_QUOTA
             break
         page += 1
         stalls = 0  # a page got through, so the block has cleared
+        waits = 0  # the budget refilled, so past waits are not consecutive
 
         if not rows:
             print("no more results")
@@ -696,7 +746,11 @@ def _walk_pages(
             print(f"    per-minute quota low ({per_minute} left); pausing for the window")
             time.sleep(MINUTE_WINDOW_PAUSE_S)
 
-        if left is not None and left <= reserve:
+        # Never let the budget reach zero, whatever --reserve says: the request
+        # after that 429s and raises, which is a crash rather than a clean stop.
+        # A reserve of 0 used to permit exactly that.
+        floor = max(reserve, MIN_DAILY_HEADROOM)
+        if left is not None and left <= floor:
             print(f"\ndaily quota nearly spent ({left} left, reserve={reserve}).")
             if continuous:
                 _sleep_until_quota_reset(key)
