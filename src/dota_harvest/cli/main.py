@@ -237,7 +237,7 @@ def _resume_walk(
     pages: int | Unlimited | None = None,
     until_ts: int | Unlimited | None = None,
     reserve: int | None = None,
-    continuous: bool = False,
+    continuous: bool | None = None,
 ) -> None:
     """Continue an unfinished walk, optionally widening how far it runs.
 
@@ -248,7 +248,8 @@ def _resume_walk(
         until_ts: Floor for this run, overriding the stored one.
             :data:`UNLIMITED` removes a floor the walk was created with.
         reserve: Daily-call headroom for this run, overriding the stored one.
-        continuous: Sleep through each quota reset instead of stopping.
+        continuous: Sleep through each quota reset instead of stopping, or
+            ``None`` to keep whatever the walk was last run with.
 
     Raises:
         SystemExit: If no walk matches, the label is ambiguous across sources,
@@ -287,11 +288,15 @@ def _resume_walk(
     run_pages = _resolve_bound(params["pages"], pages)  # pyright: ignore[reportIndexIssue]
     run_until = _resolve_bound(params["until_ts"], until_ts)  # pyright: ignore[reportIndexIssue]
     run_reserve = params["reserve"] if reserve is None else reserve  # pyright: ignore[reportIndexIssue]
-    run_continuous = continuous or bool(params.get("continuous"))  # pyright: ignore[reportAttributeAccessIssue]
+    # None means the flag was omitted, so the walk keeps whatever it had.
+    # `continuous or stored` could only ever turn the flag on, which left a
+    # walk that once ran with --continuous unable to stop sleeping.
+    run_continuous = bool(params.get("continuous")) if continuous is None else continuous  # pyright: ignore[reportAttributeAccessIssue]
     for name, stored, supplied in (
         ("pages", params["pages"], run_pages),  # pyright: ignore[reportIndexIssue]
         ("until", params["until_ts"], run_until),  # pyright: ignore[reportIndexIssue]
         ("reserve", params["reserve"], run_reserve),  # pyright: ignore[reportIndexIssue]
+        ("continuous", bool(params.get("continuous")), run_continuous),
     ):
         if supplied != stored:
             print(
@@ -360,6 +365,8 @@ def _format_params(params: dict[str, object]) -> str:
         f"min_age_hours={params['min_age_hours']:g}",
         f"reserve={params['reserve']}",
     ]
+    if params.get("continuous"):
+        parts.append("continuous=True")
     return "  ".join(parts)
 
 
@@ -623,12 +630,24 @@ def main() -> None:
         f"for reference/probe commands. Default {DEFAULT_RESERVE}. May be "
         f"changed when resuming.",
     )
+    # store_const over store_true so an omitted flag stays None and a resume can
+    # tell "not mentioned" (keep the stored setting) from "explicitly off".
     d.add_argument(
         "--continuous",
-        action="store_true",
+        action="store_const",
+        const=True,
+        default=None,
         help="keep going across daily quota resets: when the budget runs out, "
         "sleep until it returns and carry on. Requires --until or --pages so "
         "the run has a defined end. Ctrl-C always stops it.",
+    )
+    d.add_argument(
+        "--no-continuous",
+        dest="continuous",
+        action="store_const",
+        const=False,
+        help="stop at the daily quota instead of sleeping through it, "
+        "switching off --continuous on a walk that was started with it.",
     )
     d.add_argument(
         "--resume",

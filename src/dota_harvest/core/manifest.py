@@ -213,7 +213,7 @@ TERMINAL_REASONS: Final[frozenset[str]] = frozenset({STOP_REACHED_FLOOR, STOP_AR
 #:
 #: ``reserve`` qualifies because it only decides when to stop for the day: it
 #: throttles the run without touching the population it collects.
-RANGE_PARAMS: Final[frozenset[str]] = frozenset({"pages", "until_ts", "reserve"})
+RANGE_PARAMS: Final[frozenset[str]] = frozenset({"pages", "until_ts", "reserve", "continuous"})
 
 
 def walk_key(source: str, label: str) -> str:

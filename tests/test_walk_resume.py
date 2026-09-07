@@ -199,7 +199,7 @@ def test_walk_key_matches_the_cursor_format(conn):
 
 def test_range_params_are_the_bounds_and_pacing_knobs():
     """Everything else decides the population and stays locked."""
-    assert frozenset({"pages", "until_ts", "reserve"}) == RANGE_PARAMS
+    assert frozenset({"pages", "until_ts", "reserve", "continuous"}) == RANGE_PARAMS
 
 
 def test_resuming_may_change_the_page_budget(conn):
