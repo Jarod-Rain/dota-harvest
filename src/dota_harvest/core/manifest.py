@@ -202,6 +202,7 @@ STOP_PAGE_BUDGET: Final[str] = "ran out of --pages"
 STOP_QUOTA: Final[str] = "daily API quota exhausted"
 STOP_RESERVE: Final[str] = "hit --reserve"
 STOP_INTERRUPTED: Final[str] = "interrupted"
+STOP_RATE_LIMITED: Final[str] = "rate limited"
 
 #: Stop reasons that mean the walk has nothing left to collect.
 TERMINAL_REASONS: Final[frozenset[str]] = frozenset({STOP_REACHED_FLOOR, STOP_ARCHIVE_EXHAUSTED})

@@ -29,6 +29,13 @@ FALLBACK_CAP: Final[float] = 75.0
 #: Default attempts before giving up on a single request.
 DEFAULT_MAX_TRIES: Final[int] = 8
 
+#: Rate-limit windows short enough that sleeping one off is worthwhile, longest
+#: first so the reported wait matches the window that actually has to drain.
+WAITABLE_WINDOWS: Final[tuple[str, ...]] = ("hour", "minute", "second")
+
+#: How long each waitable window takes to refill, for the message on giving up.
+WINDOW_SECONDS: Final[dict[str, int]] = {"second": 1, "minute": 60, "hour": 3600}
+
 #: Seconds before a single request is abandoned.
 REQUEST_TIMEOUT: Final[float] = 60.0
 
@@ -57,6 +64,32 @@ class QuotaExhaustedError(RuntimeError):
     failure hours later, so this propagates to the caller, which checkpoints and
     exits cleanly.
     """
+
+
+class RateLimitedError(RuntimeError):
+    """Raised when a short rate-limit window outlasts the whole retry ladder.
+
+    The retry loop used to exhaust its attempts on a sustained per-minute block
+    and raise a bare :class:`RuntimeError`, which no caller could tell apart
+    from a genuine bug. That crashed ``--continuous`` runs whose entire purpose
+    was to wait such things out. Callers catch this to pause and resume.
+
+    Attributes:
+        window: The rate-limit window that was empty, e.g. ``"minute"``.
+        retry_after: Seconds until that window is expected to refill.
+    """
+
+    def __init__(self, message: str, *, window: str, retry_after: float) -> None:
+        """Record which window blocked the request and for how long.
+
+        Args:
+            message: Human-readable description of the failure.
+            window: The exhausted rate-limit window, e.g. ``"minute"``.
+            retry_after: Seconds before that window is expected to refill.
+        """
+        super().__init__(message)
+        self.window = window
+        self.retry_after = retry_after
 
 
 def host_of(url: str) -> str:
@@ -236,6 +269,35 @@ def _handle_rate_limited(
     return delay, reported
 
 
+def _spent_short_window(
+    remaining: dict[str, int],
+    resp: requests.Response,
+) -> tuple[str, float]:
+    """Identify which waitable window is blocking, and how long it needs.
+
+    Args:
+        remaining: Counters last seen from the host being called.
+        resp: The final rate-limited response, consulted for ``Retry-After``.
+
+    Returns:
+        A ``(window, seconds)`` pair. The server's own advice wins when it sent
+        any; otherwise the wait is the window's full refill period, since a
+        counter sitting at or below zero says nothing about when it last reset.
+
+    Note:
+        Falls back to ``"minute"`` when no counter is exhausted. A 429 that
+        survives the whole ladder is a real block whatever the headers claim,
+        and pausing a minute beats crashing on an unexplained one.
+    """
+    for window in WAITABLE_WINDOWS:
+        if remaining.get(window, 1) <= 0:
+            advised = retry_after_seconds(resp)
+            return window, advised if advised is not None else float(WINDOW_SECONDS[window])
+
+    advised = retry_after_seconds(resp)
+    return "minute", advised if advised is not None else float(WINDOW_SECONDS["minute"])
+
+
 def request_with_retry(
     method: str,
     url: str,
@@ -261,10 +323,12 @@ def request_with_retry(
 
     Raises:
         QuotaExhaustedError: A rate-limit window too long to wait out is spent.
+        RateLimitedError: A short window outlasted the whole retry ladder.
         requests.RequestException: The final attempt failed at the network level.
-        RuntimeError: Every attempt was consumed by retryable failures.
+        RuntimeError: Every attempt was consumed by retryable server errors.
     """
     reported = False
+    last_response: requests.Response | None = None
 
     for attempt in range(max_tries):
         try:
@@ -281,18 +345,32 @@ def request_with_retry(
         if counters := remaining_from_headers(resp):
             QUOTA.setdefault(host, {}).update(counters)
 
+        last_response = resp
         if resp.status_code == 429:
             _raise_if_quota_exhausted(QUOTA.get(host, {}))
             delay, reported = _handle_rate_limited(resp, attempt, reported)
+            if attempt == max_tries - 1:
+                # Sleeping here would only delay the raise below by a full
+                # ladder step; the loop has no attempt left to spend on it.
+                break
             time.sleep(delay)
             continue
 
         if resp.status_code >= 500:
             delay = _backoff_delay(attempt, cap=float("inf"))
             print(f"  {resp.status_code}; retry in {delay:.1f}s", file=sys.stderr)
+            if attempt == max_tries - 1:
+                break
             time.sleep(delay)
             continue
 
         return resp
 
+    if last_response is not None and last_response.status_code == 429:
+        window, wait = _spent_short_window(QUOTA.get(host_of(url), {}), last_response)
+        raise RateLimitedError(
+            f"{window}ly rate limit still blocked after {max_tries} tries: {method} {url}",
+            window=window,
+            retry_after=wait,
+        )
     raise RuntimeError(f"gave up after {max_tries} tries: {method} {url}")
