@@ -36,7 +36,7 @@ STALE_PATCH_DAYS: Final[int] = 45
 SECONDS_PER_DAY: Final[int] = 86_400
 
 #: Subdirectories the transform produces, in write order.
-OUTPUT_TABLES: Final[tuple[str, ...]] = ("players", "purchases")
+OUTPUT_TABLES: Final[tuple[str, ...]] = ("players", "purchases", "kill_events")
 
 
 def scalar(con: duckdb.DuckDBPyConnection, sql: str) -> Any:
@@ -344,6 +344,30 @@ COPY (
   (FORMAT PARQUET, PARTITION_BY (patch), COMPRESSION ZSTD, OVERWRITE_OR_IGNORE 1);
 """
 
+# One row per kill, keyed the same way as purchases so the two event streams
+# join to each other and to players on (match_id, hero_id). players.kill_events
+# keeps only the count, which cannot answer when a hero got their kills; this
+# keeps the timeline. STRATZ also exposes the victim, the ability used, the
+# bounty and the map position, none of which MATCH_FIELDS requests -- widening
+# the query would leave every already-stored match null in those columns.
+KILL_EVENTS_SQL = """
+COPY (
+  SELECT
+    m.id        AS match_id,
+    pt.name     AS patch,
+    p.heroId    AS hero_id,
+    p.isRadiant AS is_radiant,
+    p.isVictory AS is_victory,
+    ke.time     AS kill_time_s
+  FROM raw m
+  ASOF JOIN patches pt ON m.startDateTime >= pt.start_ts,
+       UNNEST(m.players) AS t(p),
+       UNNEST(p.stats.killEvents) AS u(ke)
+  WHERE p.stats.killEvents IS NOT NULL
+) TO '{out}/kill_events'
+  (FORMAT PARQUET, PARTITION_BY (patch), COMPRESSION ZSTD, OVERWRITE_OR_IGNORE 1);
+"""
+
 # Where STRATZ was still minting ids, our date-derived patch must agree with
 # theirs. It is the only period with ground truth to validate the date table.
 CROSSCHECK_SQL = """
@@ -443,7 +467,11 @@ def _write_tables(con: duckdb.DuckDBPyConnection, out: Path) -> None:
     stage.mkdir(parents=True)
 
     try:
-        for table, statement in (("players", PLAYERS_SQL), ("purchases", PURCHASES_SQL)):
+        for table, statement in (
+            ("players", PLAYERS_SQL),
+            ("purchases", PURCHASES_SQL),
+            ("kill_events", KILL_EVENTS_SQL),
+        ):
             print(f"writing {table} ...")
             con.execute(statement.format(out=stage))
         _assert_tables_written(stage)

@@ -8,6 +8,7 @@ Collect Dota 2 match data from STRATZ and OpenDota into patch-partitioned Parque
 data/parquet/
 ├── players/patch=*/       one row per (match, player) — inventory, KDA, lane, result
 ├── purchases/patch=*/     one row per purchase event — item id and timestamp
+├── kill_events/patch=*/   one row per kill — the hero and when they got it
 ├── items_meta.parquet     item taxonomy including the recipe graph
 ├── heroes.parquet
 └── patches.parquet
