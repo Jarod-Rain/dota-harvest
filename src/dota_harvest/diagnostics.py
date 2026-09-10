@@ -47,6 +47,34 @@ NEAR_ENOUGH_DAYS: Final[int] = 5
 #: Match ids tried when looking for a historical anchor in /proMatches.
 ANCHOR_CANDIDATES: Final[tuple[int, ...]] = (5_000_000_000, 6_000_000_000, 7_500_000_000)
 
+#: Item ids STRATZ reports in match inventories but never in ``itemPurchases``.
+#:
+#: These are current, purchasable 7.41 items. STRATZ returns them in ``item0Id``
+#: through ``backpack2Id`` and they show up in tens of thousands of finished
+#: inventories, yet zero appear in any purchase log -- measured at 0% logged
+#: against 91% for every other held item, on fully parsed matches, and
+#: reproduced against the live API. They are also missing from STRATZ's own
+#: ``constants { items }``, which is the likely root: an id their catalogue
+#: does not know cannot be attributed to a purchase event.
+#:
+#: The consequence is not ours to fix and refetching does not help. Anything
+#: reconstructing a build order from ``purchases`` will never see these items,
+#: so a timeline that ends holding one has an unexplained gap.
+UNLOGGED_ITEMS: Final[tuple[int, ...]] = (
+    1847,  # Splintmail
+    1848,  # Shawl
+    1849,  # Wizard Hat
+    1851,  # Essence Distiller Recipe
+    1852,  # Essence Distiller
+    1853,  # Consecrated Wraps Recipe
+    1854,  # Consecrated Wraps
+    1855,  # Crella's Crozier Recipe
+    1856,  # Crella's Crozier
+    1857,  # Hydra's Breath Recipe
+    1858,  # Hydra's Breath
+    1872,  # Chasm Stone
+)
+
 
 def _probe_ids(count: int = 2) -> list[JSONMapping]:
     """Pick match ids old enough that STRATZ has certainly indexed them.
@@ -134,6 +162,49 @@ def check(match_id: int | None = None) -> None:
 
     print("\nstep 3: schema drift ...")
     check_schema(sample=found)
+
+    print("\nstep 4: unlogged items ...")
+    check_unlogged_items()
+
+
+def check_unlogged_items(out: Path = PARQUET_DIR) -> None:
+    """Measure how many held items never appear in the purchase log.
+
+    Args:
+        out: Directory holding the built Parquet tables.
+
+    Note:
+        Reports the size of a known STRATZ defect rather than asserting a
+        threshold: see :data:`UNLOGGED_ITEMS`. Nothing here can fix it, but a
+        build order reconstructed from ``purchases`` is incomplete by exactly
+        this much, and that number belongs in the open where it can be cited.
+    """
+    players = out / "players"
+    purchases = out / "purchases"
+    if not players.exists() or not purchases.exists():
+        print("  no built tables yet; run `dota-harvest transform` first")
+        return
+
+    ids = ", ".join(str(item) for item in UNLOGGED_ITEMS)
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    held = con.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{players}/**/*.parquet', hive_partitioning=true) p, "
+        f"UNNEST(list_concat(p.inventory, p.backpack)) AS u(item) WHERE u.item IN ({ids})"
+    ).fetchone()
+    bought = con.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{purchases}/**/*.parquet', hive_partitioning=true) "
+        f"WHERE item_id IN ({ids})"
+    ).fetchone()
+
+    held_n = held[0] if held else 0
+    bought_n = bought[0] if bought else 0
+    print(f"  {held_n:,} inventory slots hold an item STRATZ never logs a purchase for")
+    print(f"  {bought_n:,} matching purchase rows exist")
+    if held_n and not bought_n:
+        print("  as expected: these ids reach us only as terminal state, never as events")
+    elif bought_n:
+        print("  STRATZ appears to have started logging these -- revisit UNLOGGED_ITEMS")
 
 
 def _flatten(tree: FieldTree, prefix: str = "") -> set[str]:

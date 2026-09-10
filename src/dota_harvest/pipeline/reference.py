@@ -368,12 +368,54 @@ def build_item_meta(out: Path = PARQUET_DIR) -> None:
 
     stratz_items = out / "items.parquet"
     if stratz_items.exists():
-        missing = scalar(
-            con,
-            f"SELECT COUNT(*) FROM read_parquet('{stratz_items}') s WHERE s.id NOT IN "
-            f"(SELECT item_id FROM read_parquet('{out}/items_meta.parquet'))",
-        )
-        print(
-            f"  {missing} STRATZ item ids absent from OpenDota constants "
-            f"(likely neutrals or new items)"
-        )
+        _report_catalogue_gaps(con, out, stratz_items)
+
+
+def _report_catalogue_gaps(
+    con: duckdb.DuckDBPyConnection,
+    out: Path,
+    stratz_items: Path,
+) -> None:
+    """Compare the two item catalogues in both directions.
+
+    Args:
+        con: Open DuckDB connection.
+        out: Directory holding ``items_meta.parquet``.
+        stratz_items: Path to the STRATZ-sourced ``items.parquet``.
+
+    Note:
+        The catalogues are complementary, not redundant: STRATZ keeps ids for
+        items Valve has since removed, and OpenDota lists current items STRATZ
+        has not added. Reporting only the STRATZ-minus-OpenDota direction hid a
+        real gap -- STRATZ's ``constants`` omits twelve purchasable 7.41 items
+        (Essence Distiller, Consecrated Wraps, Crella's Crozier, Hydra's
+        Breath, Chasm Stone, Splintmail, Shawl, Wizard Hat and their recipes)
+        that appear in live match inventories. Anything resolving an id through
+        ``items.parquet`` alone silently misses them, so both directions are
+        named here.
+
+        These ids reach us through match data regardless: see
+        :data:`~dota_harvest.diagnostics.UNLOGGED_ITEMS` for the separate
+        STRATZ defect that keeps them out of the purchase log.
+    """
+    meta = f"read_parquet('{out}/items_meta.parquet')"
+    stratz = f"read_parquet('{stratz_items}')"
+
+    only_stratz = scalar(
+        con, f"SELECT COUNT(*) FROM {stratz} s WHERE s.id NOT IN (SELECT item_id FROM {meta})"
+    )
+    print(
+        f"  {only_stratz} STRATZ item ids absent from OpenDota constants "
+        f"(removed items and neutrals)"
+    )
+
+    # Only purchasable items matter here: cosmetics and internal placeholders
+    # drift constantly and would bury a real omission in noise.
+    rows = con.execute(
+        f"SELECT item_id, display_name, cost FROM {meta} "
+        f"WHERE cost > 0 AND item_id NOT IN (SELECT id FROM {stratz}) "
+        f"ORDER BY item_id"
+    ).fetchall()
+    print(f"  {len(rows)} purchasable OpenDota items absent from STRATZ constants")
+    for item_id, name, cost in rows:
+        print(f"    {item_id:>5}  {name} ({cost}g)")
