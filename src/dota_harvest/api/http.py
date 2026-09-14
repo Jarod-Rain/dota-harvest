@@ -19,7 +19,7 @@ import requests
 
 #: Never sleep longer than this on a server's advice. Blind trust in
 #: ``Retry-After`` is how an unattended job sleeps until morning.
-MAX_HONOURED_WAIT: Final[float] = 300.0
+MAX_HONOURED_WAIT: Final[float] = 3000.0
 
 #: Ceiling for computed backoff, used only when the server declines to advise.
 #: Per-minute windows are common, so a ladder topping out below 60s can never
