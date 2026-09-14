@@ -17,9 +17,19 @@ from urllib.parse import urlsplit
 
 import requests
 
-#: Never sleep longer than this on a server's advice. Blind trust in
-#: ``Retry-After`` is how an unattended job sleeps until morning.
+#: Longest ``Retry-After`` this loop will sit out. Advice within it is honoured
+#: verbatim; anything beyond raises :class:`QuotaExhaustedError` instead.
+#:
+#: It used to clamp: a 43,982s wait became a 3,000s sleep and the loop retried
+#: anyway, so eight tries covered 40 minutes of a 12-hour reset and every
+#: request was refused on arrival. Blind trust in ``Retry-After`` would have an
+#: unattended job sleep until morning, but pretending a long block is a short
+#: one just burns the retry budget and reports the failure hours late.
 MAX_HONOURED_WAIT: Final[float] = 3000.0
+
+#: Sanity bound on a daily-reset sleep. The wait comes from the server, so this
+#: only guards a nonsense ``Retry-After``; a real daily window never exceeds it.
+MAX_DAILY_WAIT: Final[float] = 24 * 3600 + 300
 
 #: Ceiling for computed backoff, used only when the server declines to advise.
 #: Per-minute windows are common, so a ladder topping out below 60s can never
@@ -120,7 +130,7 @@ def quota_for(url_or_host: str) -> dict[str, int]:
 
 
 def remaining_from_headers(resp: requests.Response) -> dict[str, int]:
-    """Read any ``X-Rate-Limit-Remaining-*`` counters the server volunteered.
+    """Read any remaining-request counters the server volunteered.
 
     Args:
         resp: Any response, successful or not.
@@ -130,16 +140,26 @@ def remaining_from_headers(resp: requests.Response) -> dict[str, int]:
         Unparseable values are skipped rather than raising.
 
     Note:
-        OpenDota sends ``Remaining-Minute`` and ``Remaining-Day``. The daily
-        counter is undocumented -- their published limits are 50k/month and
-        60/minute -- and it goes negative once exceeded.
+        The two vendors spell the header differently, and matching only one
+        spelling is how a spent daily quota goes unnoticed. OpenDota sends
+        ``X-Rate-Limit-Remaining-Minute`` and ``-Day``; STRATZ sends
+        ``x-ratelimit-remaining-second``/``-minute``/``-hour``/``-day`` with no
+        hyphen in "ratelimit". Matching only the hyphenated form left STRATZ's
+        counters invisible, so ``x-ratelimit-remaining-day=0`` read as unknown
+        and the daily guard never fired.
+
+        Both daily counters are undocumented, and OpenDota's goes negative once
+        exceeded, so callers must treat an absent counter as unknown rather
+        than as zero.
     """
     counters: dict[str, int] = {}
     for name, value in resp.headers.items():
         lowered = name.lower()
-        if lowered.startswith("x-rate-limit-remaining-"):
+        # Normalise "x-rate-limit-" and "x-ratelimit-" to one spelling.
+        canonical = lowered.replace("x-rate-limit-", "x-ratelimit-")
+        if canonical.startswith("x-ratelimit-remaining-"):
             try:
-                counters[lowered.rsplit("-", 1)[-1]] = int(value)
+                counters[canonical.rsplit("-", 1)[-1]] = int(value)
             except ValueError:
                 continue
     return counters
@@ -211,6 +231,24 @@ def _backoff_delay(attempt: int, cap: float = FALLBACK_CAP) -> float:
     return min(2.0**attempt, cap) + random.random()
 
 
+def _daily_reset_is_waitable(resp: requests.Response) -> bool:
+    """Report whether this 429 is a spent day the loop should sleep through.
+
+    Args:
+        resp: The rate-limited response.
+
+    Returns:
+        ``True`` when the daily counter is exhausted *and* the server advised a
+        usable delay. Both halves matter: a spent day is the one window worth
+        sitting out for hours, but only because STRATZ states the reset. With
+        no advice there is nothing to wait on, so the caller stops instead.
+    """
+    if remaining_from_headers(resp).get("day", 1) > 0:
+        return False
+    advised = retry_after_seconds(resp)
+    return advised is not None and advised > 0
+
+
 def _raise_if_quota_exhausted(remaining: dict[str, int]) -> None:
     """Fail fast when a long rate-limit window has been used up.
 
@@ -254,16 +292,28 @@ def _handle_rate_limited(
         reported = True
 
     advised = retry_after_seconds(resp)
+
     if advised is None:
         delay = _backoff_delay(attempt)
         source = "backoff"
-    else:
-        delay = min(advised, MAX_HONOURED_WAIT)
-        source = (
-            f"Retry-After capped from {advised:.0f}s"
-            if advised > MAX_HONOURED_WAIT
-            else "Retry-After"
+    elif _daily_reset_is_waitable(resp):
+        # The one long wait worth sitting out: the day is spent and the server
+        # said exactly when it refills, so honour it uncapped rather than
+        # clamping and retrying into a window that cannot have moved.
+        delay = min(advised, MAX_DAILY_WAIT)
+        source = f"daily quota reset in {delay / 3600:.1f}h"
+    elif advised > MAX_HONOURED_WAIT:
+        # Any other block advising longer than the ceiling is not something a
+        # retry loop can absorb. Capping and retrying anyway is what turned one
+        # block into a ladder of guaranteed-429 requests.
+        raise QuotaExhaustedError(
+            f"rate limit needs {advised:.0f}s to clear, beyond the "
+            f"{MAX_HONOURED_WAIT:.0f}s this loop will wait. "
+            f"Counters: {remaining_from_headers(resp) or '(none sent)'}."
         )
+    else:
+        delay = advised
+        source = "Retry-After"
 
     print(f"  429 rate limited; sleeping {delay:.1f}s ({source})", file=sys.stderr)
     return delay, reported
@@ -322,7 +372,9 @@ def request_with_retry(
         The first response that is neither rate-limited nor a server error.
 
     Raises:
-        QuotaExhaustedError: A rate-limit window too long to wait out is spent.
+        QuotaExhaustedError: A long rate-limit window is spent and the server
+            gave no usable ``Retry-After``. A spent day that *does* carry advice
+            is slept through instead, so a fetch can run across the reset.
         RateLimitedError: A short window outlasted the whole retry ladder.
         requests.RequestException: The final attempt failed at the network level.
         RuntimeError: Every attempt was consumed by retryable server errors.
@@ -347,7 +399,12 @@ def request_with_retry(
 
         last_response = resp
         if resp.status_code == 429:
-            _raise_if_quota_exhausted(QUOTA.get(host, {}))
+            # A spent daily quota is worth waiting out when the server says
+            # exactly how long: STRATZ sends the reset, so the wait is known
+            # rather than guessed. Without that advice there is nothing to wait
+            # on, and the caller must checkpoint and resume instead.
+            if not _daily_reset_is_waitable(resp):
+                _raise_if_quota_exhausted(QUOTA.get(host, {}))
             delay, reported = _handle_rate_limited(resp, attempt, reported)
             if attempt == max_tries - 1:
                 # Sleeping here would only delay the raise below by a full
