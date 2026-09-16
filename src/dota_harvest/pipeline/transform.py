@@ -35,6 +35,14 @@ STALE_PATCH_DAYS: Final[int] = 45
 
 SECONDS_PER_DAY: Final[int] = 86_400
 
+#: Share of available RAM DuckDB may use. The rest absorbs the Python process,
+#: the page cache the gzip readers need, and whatever else is running.
+MEMORY_HEADROOM: Final[float] = 0.7
+
+#: Floor for the computed budget. Below this DuckDB spills so constantly that a
+#: transform would never finish, so a cramped machine should fail loudly instead.
+MIN_MEMORY_LIMIT_BYTES: Final[int] = 2 * 2**30
+
 #: Subdirectories the transform produces, in write order.
 OUTPUT_TABLES: Final[tuple[str, ...]] = ("players", "purchases", "kill_events")
 
@@ -543,6 +551,66 @@ def _report_crosscheck(con: duckdb.DuckDBPyConnection) -> None:
         print(f"  STRATZ says {stratz_name}, we derive {derived_name}: {count:,} matches")
 
 
+def available_memory_bytes() -> int | None:
+    """Read how much RAM the kernel says is actually free for a new workload.
+
+    Returns:
+        ``MemAvailable`` in bytes, or ``None`` where /proc is unreadable.
+
+    Note:
+        ``MemAvailable`` rather than ``MemTotal``: DuckDB's default budget is a
+        share of total RAM, which on a box already holding 16 GiB of other work
+        is a promise the machine cannot keep. That is what the OOM killer
+        settled -- it took the transform at 15 GiB RSS with swap full.
+    """
+    try:
+        with Path("/proc/meminfo").open(encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _configure_memory(con: duckdb.DuckDBPyConnection, out: Path) -> None:
+    """Bound DuckDB's memory use and give it somewhere to spill.
+
+    Args:
+        con: Open DuckDB connection.
+        out: Output directory, whose filesystem hosts the spill files.
+
+    Note:
+        Three settings, each of which alone was enough to kill a large run.
+
+        ``preserve_insertion_order`` is the expensive one. Left on, a
+        partitioned ``COPY`` buffers the whole ordered result before writing,
+        so the purchases table -- a double ``UNNEST`` over every match -- had to
+        fit in RAM in one piece. Nothing downstream depends on row order within
+        a partition, so streaming costs us nothing.
+
+        ``memory_limit`` defaults to a share of *total* RAM. Sizing it from
+        what is actually available instead leaves room for the rest of the
+        machine, and DuckDB spills past it rather than dying.
+
+        ``temp_directory`` defaults to a relative ``.tmp``, which an in-memory
+        database will not reliably use. Pointing it at the output filesystem
+        gives the spill a real home on the disk that already holds the corpus.
+    """
+    con.execute("SET preserve_insertion_order = false")
+
+    spill = out / ".tmp"
+    spill.mkdir(parents=True, exist_ok=True)
+    con.execute(f"SET temp_directory = '{spill}'")
+
+    available = available_memory_bytes()
+    if available is None:
+        return
+    budget = max(int(available * MEMORY_HEADROOM), MIN_MEMORY_LIMIT_BYTES)
+    con.execute(f"SET memory_limit = '{budget // 2**20}MiB'")
+    print(f"  memory limit {budget / 2**30:.1f} GiB, spilling to {spill}")
+
+
 def run(raw: Path = RAW_DIR, out: Path = PARQUET_DIR) -> None:
     """Convert the raw landing zone into patch-partitioned Parquet.
 
@@ -569,6 +637,7 @@ def run(raw: Path = RAW_DIR, out: Path = PARQUET_DIR) -> None:
         sys.exit(f"no readable *.jsonl.gz files in {raw}. Run `dota-harvest fetch` first.")
 
     con = duckdb.connect()
+    _configure_memory(con, out)
     patches = _register_views(con, files, out)
 
     print(f"{scalar(con, 'SELECT COUNT(*) FROM raw'):,} matches in raw")
