@@ -165,12 +165,21 @@ def stratz_headers() -> dict[str, str]:
     }
 
 
-def stratz_query(query: str, variables: JSONMapping | None = None) -> JSONMapping:
+def stratz_query(
+    query: str,
+    variables: JSONMapping | None = None,
+    *,
+    sleep_through_daily_reset: bool = True,
+) -> JSONMapping:
     """Execute a GraphQL query against STRATZ.
 
     Args:
         query: GraphQL document to execute.
         variables: Optional variable bindings.
+        sleep_through_daily_reset: Whether to block until a spent daily quota
+            refills. Pass ``False`` to raise
+            :class:`~dota_harvest.api.http.QuotaExhaustedError` instead, so a
+            caller with work to checkpoint can flush it before waiting.
 
     Returns:
         The decoded response body, which may carry ``data``, ``errors``, or
@@ -186,6 +195,7 @@ def stratz_query(query: str, variables: JSONMapping | None = None) -> JSONMappin
         STRATZ_URL,
         headers=stratz_headers(),
         json={"query": query, "variables": variables or {}},
+        sleep_through_daily_reset=sleep_through_daily_reset,
     )
     if resp.status_code == 403:
         sys.exit(

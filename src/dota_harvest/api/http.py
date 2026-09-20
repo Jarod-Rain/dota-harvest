@@ -353,6 +353,7 @@ def request_with_retry(
     url: str,
     *,
     max_tries: int = DEFAULT_MAX_TRIES,
+    sleep_through_daily_reset: bool = True,
     **kwargs: Any,
 ) -> requests.Response:
     """Issue an HTTP request, retrying transient failures with backoff.
@@ -366,6 +367,12 @@ def request_with_retry(
         method: HTTP verb.
         url: Absolute request URL.
         max_tries: Attempts before giving up.
+        sleep_through_daily_reset: Whether to block here until a spent daily
+            quota refills. On by default, which suits a caller that has nothing
+            to checkpoint. Pass ``False`` to get :class:`QuotaExhaustedError`
+            instead and do the waiting yourself -- necessary for a caller that
+            must first flush its own work, since this sleep happens inside a
+            single HTTP call and can last hours.
         **kwargs: Passed through to ``requests.request``.
 
     Returns:
@@ -403,7 +410,12 @@ def request_with_retry(
             # exactly how long: STRATZ sends the reset, so the wait is known
             # rather than guessed. Without that advice there is nothing to wait
             # on, and the caller must checkpoint and resume instead.
-            if not _daily_reset_is_waitable(resp):
+            #
+            # Sleeping here blocks inside one HTTP call, so a caller that wants
+            # to checkpoint first -- write its shard, rebuild Parquet -- never
+            # gets the chance. `sleep_through_daily_reset` lets such a caller
+            # opt out and handle the wait itself.
+            if not (sleep_through_daily_reset and _daily_reset_is_waitable(resp)):
                 _raise_if_quota_exhausted(QUOTA.get(host, {}))
             delay, reported = _handle_rate_limited(resp, attempt, reported)
             if attempt == max_tries - 1:
