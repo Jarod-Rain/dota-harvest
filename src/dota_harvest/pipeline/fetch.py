@@ -14,6 +14,7 @@ import sys
 import time
 import uuid
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -148,11 +149,36 @@ def _report(written: int, started: float, destination: Path) -> None:
     print(f"wrote {written:,} matches in {elapsed / 60:.1f} min ({rate:,.0f}/hr) -> {destination}")
 
 
+@dataclass
+class Outcome:
+    """Why a fetch run ended, for a caller that must react to the reason.
+
+    ``run`` returns a plain count, which cannot distinguish "the backlog is
+    empty" from "the daily quota is gone" -- and those call for opposite
+    responses: stop, or checkpoint and wait for the reset. This records the
+    distinction for callers that need it.
+
+    Attributes:
+        written: Matches whose detail reached the shard.
+        quota_spent: Whether a daily API budget refused further requests.
+    """
+
+    written: int = 0
+    quota_spent: bool = False
+
+
+#: Why the most recent :func:`run` ended. Module state rather than a return
+#: value so the signature stays compatible with callers that only want a count.
+LAST: Outcome = Outcome()
+
+
 def run(
     limit: int = 1000,
     batch: int = STRATZ_BATCH,
     sleep: float = STRATZ_SLEEP,
     walks: Sequence[str] | None = None,
+    *,
+    wait_for_quota: bool = True,
 ) -> int:
     """Fetch detail for pending match ids and append it to a new raw shard.
 
@@ -167,14 +193,21 @@ def run(
         sleep: Seconds to pause between requests.
         walks: Restrict to these walk selectors (``"label"`` or
             ``"source:label"``). ``None`` fetches from every walk.
+        wait_for_quota: Whether the transport may block for hours waiting out a
+            spent daily quota. ``False`` returns as soon as the budget is gone,
+            leaving the wait to the caller -- which is what lets a pipeline
+            write its shard and rebuild Parquet before sleeping.
 
     Returns:
         The number of matches written. Zero means the output shard was removed.
+        Why the run ended is recorded in :data:`LAST`.
 
     Note:
         Safe to interrupt and re-run. Ids are only marked once their response is
         on disk, so anything unattempted stays pending.
     """
+    global LAST  # noqa: PLW0603 - the outcome of the most recent run
+    LAST = Outcome()
     conn = connect()
     ids = pending_ids(conn, limit, walks)
     if not ids:
@@ -197,9 +230,13 @@ def run(
     with gzip.open(destination, "wt", encoding="utf-8") as handle:
         for index, group in enumerate(chunks(ids, batch)):
             try:
-                payload = stratz_query(build_batch_query(group))
+                payload = stratz_query(
+                    build_batch_query(group),
+                    sleep_through_daily_reset=wait_for_quota,
+                )
             except QuotaExhaustedError as exc:
                 # Pending ids stay pending; this batch was never attempted.
+                LAST.quota_spent = True
                 print(f"\n{exc}\nStopping; re-run to resume.", file=sys.stderr)
                 break
             except Exception as exc:  # noqa: BLE001 - any failure is per-batch
@@ -260,5 +297,6 @@ def run(
         print("wrote 0 matches; removed empty output file")
         return 0
 
+    LAST.written = written
     _report(written, started, destination)
     return written

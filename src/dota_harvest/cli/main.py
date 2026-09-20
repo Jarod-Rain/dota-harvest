@@ -31,7 +31,7 @@ from dota_harvest.core.manifest import (
     remove_walks,
 )
 from dota_harvest.diagnostics import check, probe_retention, probe_versions
-from dota_harvest.pipeline import discover, fetch, pro, reference, transform
+from dota_harvest.pipeline import discover, fetch, orchestrate, pro, reference, transform
 
 SECONDS_PER_DAY: Final[int] = 86_400
 
@@ -197,6 +197,11 @@ TUNING_FLAGS: Final[tuple[str, ...]] = (
     "--min-age-hours",
     "--no-seek",
 )
+
+#: Rank-tier floor when none is given: 11 is the lowest real tier, so it admits
+#: every ranked match. Shared by `discover` and `pipeline` so the two cannot
+#: drift into filtering different populations under the same label.
+DEFAULT_MIN_RANK: Final[int] = 11
 
 #: Flags a resume may override. These bound how far a run travels rather than
 #: which matches qualify, so changing one extends or shortens the walk without
@@ -489,6 +494,28 @@ def cmd_transform(args: argparse.Namespace) -> None:  # noqa: ARG001
     transform.run()
 
 
+def cmd_pipeline(args: argparse.Namespace) -> None:
+    """Discover, fetch, and transform one walk in a single run."""
+    orchestrate.run(
+        source=args.source,
+        label=args.label,
+        min_rank=args.min_rank,
+        until_ts=None if args.until is UNLIMITED else args.until,
+        sample=args.sample,
+        ranked_only=not args.all_lobbies,
+        min_age_hours=args.min_age_hours,
+        reserve=DEFAULT_RESERVE if args.reserve is None else args.reserve,
+        seek=not args.no_seek,
+        resume=args.resume,
+        batch=args.batch,
+        sleep=args.sleep,
+        daily_budget=args.daily_budget,
+        slice_size=args.slice_size,
+        do_transform=not args.no_transform,
+        continuous=args.continuous,
+    )
+
+
 def cmd_paths(args: argparse.Namespace) -> None:  # noqa: ARG001
     """Print where every configured path resolved to."""
     print(describe_paths())
@@ -568,9 +595,9 @@ def main() -> None:
     d.add_argument(
         "--min-rank",
         type=int,
-        default=11,
+        default=DEFAULT_MIN_RANK,
         help="rank tier: 1x=Herald, 2x=Guardian, ... , "
-        "8x=Immortal; x=star value [1-5]. Default 11 (no minimum).",
+        f"8x=Immortal; x=star value [1-5]. Default {DEFAULT_MIN_RANK} (no minimum).",
     )
     # Defaults to None so a resume can tell an explicit --pages from an
     # untouched one, and so an unbounded run is the default: with no page cap,
@@ -695,6 +722,72 @@ def main() -> None:
     t = sub.add_parser("transform", help="raw JSONL -> partitioned Parquet")
     t.set_defaults(fn=cmd_transform)
 
+    pl = sub.add_parser(
+        "pipeline",
+        help="discover, fetch, and transform one walk in a single run",
+        description=(
+            "Alternate discovery and fetching in slices, then rebuild the "
+            "Parquet tables. STRATZ allows about "
+            f"{orchestrate.DAILY_MATCH_BUDGET:,} matches of detail a day, so "
+            "discovery is capped there rather than building a backlog the "
+            "fetcher cannot reach for days. Every stage reads its own progress "
+            "from the manifest, so a walk resumes from whatever stage it "
+            "stopped in."
+        ),
+    )
+    pl.add_argument("--label", required=True, help="walk label, or 'source:label' with --resume")
+    pl.add_argument("--source", choices=["public", "pro"], default="public")
+    pl.add_argument(
+        "--min-rank",
+        type=int,
+        default=DEFAULT_MIN_RANK,
+        help=f"rank tier floor, as for `discover`. Default {DEFAULT_MIN_RANK} (no minimum).",
+    )
+    pl.add_argument("--until", type=date_floor, default=None)
+    pl.add_argument("--sample", type=fraction, default=1.0)
+    pl.add_argument("--all-lobbies", action="store_true")
+    pl.add_argument("--min-age-hours", type=float, default=MIN_MATCH_AGE_HOURS)
+    pl.add_argument("--reserve", type=int, default=None)
+    pl.add_argument("--no-seek", action="store_true")
+    pl.add_argument(
+        "--resume",
+        action="store_true",
+        help="read --label as a full 'source:label' selector, for a label used "
+        "under more than one source. An existing walk keeps its original "
+        "filters either way.",
+    )
+    pl.add_argument("--batch", type=int, default=STRATZ_BATCH)
+    pl.add_argument("--sleep", type=float, default=STRATZ_SLEEP)
+    pl.add_argument(
+        "--daily-budget",
+        type=int,
+        default=orchestrate.DAILY_MATCH_BUDGET,
+        help=f"matches to discover at most, across all slices. Default "
+        f"{orchestrate.DAILY_MATCH_BUDGET:,}, which is what a day of STRATZ "
+        f"calls can fetch detail for.",
+    )
+    pl.add_argument(
+        "--slice-size",
+        type=int,
+        default=orchestrate.SLICE_MATCHES,
+        help=f"matches to discover before handing over to the fetcher. "
+        f"Default {orchestrate.SLICE_MATCHES:,}.",
+    )
+    pl.add_argument(
+        "--no-transform",
+        action="store_true",
+        help="skip the Parquet rebuild even when new detail landed",
+    )
+    pl.add_argument(
+        "--continuous",
+        action="store_true",
+        help="sleep through each quota reset and keep going until the walk is "
+        "fully discovered and drained. Each day's matches are transformed "
+        "before the sleep, so the Parquet tables are current at every reset. "
+        "Ctrl-C always stops it.",
+    )
+    pl.set_defaults(fn=cmd_pipeline)
+
     lg = sub.add_parser("leagues", help="search leagues by name")
     lg.add_argument("pattern", help="substring, e.g. 'International 2026'")
     lg.set_defaults(fn=cmd_leagues)
@@ -733,7 +826,10 @@ def main() -> None:
     p.set_defaults(fn=cmd_probe)
 
     a = ap.parse_args()
-    if getattr(a, "resume", None):
+    # Scoped to `discover`, whose --resume takes a selector *instead of* the
+    # tuning flags. `pipeline` names its walk with --label and treats --resume
+    # as a boolean, so the same check there would reject its normal usage.
+    if a.cmd == "discover" and getattr(a, "resume", None):
         # Inspect argv rather than the parsed namespace: defaults are
         # indistinguishable from values the user typed, and only a typed flag
         # signals an expectation that it will take effect.
@@ -751,14 +847,23 @@ def main() -> None:
                 f"({', '.join(RESUMABLE_OVERRIDES)} may be changed on a resume.)"
             )
 
-    # A continuous run sleeps through every quota reset, so without a bound it
-    # would never stop on its own. A resume inherits the stored --until, which
-    # counts; only a fresh walk has to say so up front.
+    # A continuous `discover` sleeps through every quota reset, so without a
+    # bound it would never stop on its own. A resume inherits the stored
+    # --until, which counts; only a fresh walk has to say so up front.
+    #
+    # `pipeline` needs no such bound: it also has to drain the fetch backlog,
+    # so it terminates when the walk is fully discovered and drained whether or
+    # not a floor was given.
     unbounded = getattr(a, "until", None) in (None, UNLIMITED) and getattr(a, "pages", None) in (
         None,
         UNLIMITED,
     )
-    if getattr(a, "continuous", False) and not getattr(a, "resume", None) and unbounded:
+    if (
+        a.cmd == "discover"
+        and getattr(a, "continuous", False)
+        and not getattr(a, "resume", None)
+        and unbounded
+    ):
         ap.error(
             "--continuous needs --until or --pages to bound the run, otherwise "
             "it never stops on its own. (Ctrl-C always stops it.)"
